@@ -123,6 +123,18 @@ class Executor(ExecutorBase):
     def profile(self, is_start: bool = True):
         self.collective_rpc("profile", args=(is_start,))
 
+    def get_gpu_utilization(self) -> float:
+        try:
+            responses = self.collective_rpc("get_gpu_utilization")
+        except Exception:
+            return 0.0
+        if not responses:
+            return 0.0
+        valid = [float(resp) for resp in responses if isinstance(resp, (int, float))]
+        if not valid:
+            return 0.0
+        return sum(valid) / len(valid)
+
 
 class UniProcExecutor(UniProcExecutorV0, Executor):
     pass

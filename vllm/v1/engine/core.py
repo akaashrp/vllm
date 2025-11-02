@@ -321,6 +321,15 @@ class EngineCore:
             scheduler_output, model_output
         )  # type: ignore
 
+        gpu_utilization = 0.0
+        try:
+            gpu_utilization = self.model_executor.get_gpu_utilization()
+        except Exception:  # pragma: no cover - best effort metric
+            pass
+        for eco in engine_core_outputs.values():
+            if eco.scheduler_stats is not None:
+                eco.scheduler_stats.gpu_utilization = gpu_utilization
+
         return (engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0)
 
     def post_step(self, model_executed: bool) -> None:

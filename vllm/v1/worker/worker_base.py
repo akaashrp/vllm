@@ -172,6 +172,10 @@ class WorkerBase:
         """Clean up resources held by the worker."""
         return
 
+    def get_gpu_utilization(self) -> float:
+        """Return instantaneous GPU utilization as a ratio in [0.0, 1.0]."""
+        return 0.0
+
 
 class WorkerWrapperBase:
     """

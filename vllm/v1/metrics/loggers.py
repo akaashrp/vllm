@@ -22,6 +22,34 @@ logger = init_logger(__name__)
 StatLoggerFactory = Callable[[VllmConfig, int], "StatLoggerBase"]
 
 
+class RunningStats:
+    """Online algorithm for tracking running mean and variance."""
+
+    __slots__ = ("count", "mean", "_m2")
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.mean = 0.0
+        self._m2 = 0.0
+
+    def update(self, value: float) -> None:
+        self.count += 1
+        delta = value - self.mean
+        self.mean += delta / self.count
+        delta2 = value - self.mean
+        self._m2 += delta * delta2
+
+    @property
+    def variance(self) -> float:
+        if self.count <= 1:
+            return 0.0
+        return self._m2 / self.count
+
+    @property
+    def stddev(self) -> float:
+        return self.variance ** 0.5
+
+
 class StatLoggerBase(ABC):
     """Interface for logging metrics.
 
@@ -62,6 +90,8 @@ class LoggingStatLogger(StatLoggerBase):
         self.kv_connector_logging = KVConnectorLogging(kv_tranfer_config)
         self.last_prompt_throughput: float = 0.0
         self.last_generation_throughput: float = 0.0
+        self.prompt_length_stats = RunningStats()
+        self.generation_length_stats = RunningStats()
 
     def _reset(self, now):
         self.last_log_time = now
@@ -74,6 +104,11 @@ class LoggingStatLogger(StatLoggerBase):
         # Save tracked stats for token counters.
         self.num_prompt_tokens += iteration_stats.num_prompt_tokens
         self.num_generation_tokens += iteration_stats.num_generation_tokens
+        for finished_request in iteration_stats.finished_requests:
+            self.prompt_length_stats.update(finished_request.num_prompt_tokens)
+            self.generation_length_stats.update(
+                finished_request.num_generation_tokens
+            )
 
     def _get_throughput(self, tracked_stats: int, now: float) -> float:
         # Compute summary metrics for tracked stats
@@ -109,6 +144,13 @@ class LoggingStatLogger(StatLoggerBase):
         self._reset(now)
 
         scheduler_stats = self.last_scheduler_stats
+        gpu_util_pct = scheduler_stats.gpu_utilization * 100
+        prefix_hit_rate_rolling = self.prefix_caching_metrics.hit_rate * 100
+        prefix_hit_rate_step = scheduler_stats.kv_cache_hit_rate * 100
+        prompt_len_mean = self.prompt_length_stats.mean
+        prompt_len_std = self.prompt_length_stats.stddev
+        generation_len_mean = self.generation_length_stats.mean
+        generation_len_std = self.generation_length_stats.stddev
 
         log_fn = logger.info
         if not any(
@@ -130,15 +172,23 @@ class LoggingStatLogger(StatLoggerBase):
             "Avg prompt throughput: %.1f tokens/s, "
             "Avg generation throughput: %.1f tokens/s, "
             "Running: %d reqs, Waiting: %d reqs, "
-            "GPU KV cache usage: %.1f%%, "
-            "Prefix cache hit rate: %.1f%%",
+            "GPU util: %.1f%%, GPU KV cache usage: %.1f%%, "
+            "Prefix cache hit rate: %.1f%% (step: %.1f%%), "
+            "Avg prompt len: %.1f±%.1f tokens, "
+            "Avg generation len: %.1f±%.1f tokens",
             self.engine_index,
             prompt_throughput,
             generation_throughput,
             scheduler_stats.num_running_reqs,
             scheduler_stats.num_waiting_reqs,
+            gpu_util_pct,
             scheduler_stats.kv_cache_usage * 100,
-            self.prefix_caching_metrics.hit_rate * 100,
+            prefix_hit_rate_rolling,
+            prefix_hit_rate_step,
+            prompt_len_mean,
+            prompt_len_std,
+            generation_len_mean,
+            generation_len_std,
         )
         self.spec_decoding_logging.log(log_fn=log_fn)
         self.kv_connector_logging.log(log_fn=log_fn)
@@ -268,6 +318,74 @@ class PrometheusStatLogger(StatLoggerBase):
             gauge_kv_cache_usage, engine_indexes, model_name
         )
 
+        gauge_gpu_utilization = self._gauge_cls(
+            name="vllm:gpu_utilization_perc",
+            documentation="GPU utilization from NVML. 1 means 100 percent usage.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_gpu_utilization = make_per_engine(
+            gauge_gpu_utilization, engine_indexes, model_name
+        )
+
+        gauge_kv_cache_hit_rate = self._gauge_cls(
+            name="vllm:kv_cache_hit_rate_perc",
+            documentation="Fraction of KV cache lookups served from cache. 1 means 100 percent hits.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_kv_cache_hit_rate = make_per_engine(
+            gauge_kv_cache_hit_rate, engine_indexes, model_name
+        )
+
+        gauge_prompt_tokens_mean = self._gauge_cls(
+            name="vllm:prompt_tokens_mean",
+            documentation="Running mean of prompt token length for finished requests.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_prompt_tokens_mean = make_per_engine(
+            gauge_prompt_tokens_mean, engine_indexes, model_name
+        )
+
+        gauge_prompt_tokens_std = self._gauge_cls(
+            name="vllm:prompt_tokens_std",
+            documentation="Running standard deviation of prompt token length for finished requests.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_prompt_tokens_std = make_per_engine(
+            gauge_prompt_tokens_std, engine_indexes, model_name
+        )
+
+        gauge_generation_tokens_mean = self._gauge_cls(
+            name="vllm:generation_tokens_mean",
+            documentation="Running mean of generation token length for finished requests.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_generation_tokens_mean = make_per_engine(
+            gauge_generation_tokens_mean, engine_indexes, model_name
+        )
+
+        gauge_generation_tokens_std = self._gauge_cls(
+            name="vllm:generation_tokens_std",
+            documentation="Running standard deviation of generation token length for finished requests.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_generation_tokens_std = make_per_engine(
+            gauge_generation_tokens_std, engine_indexes, model_name
+        )
+
+        self.prompt_length_stats = {idx: RunningStats() for idx in engine_indexes}
+        self.generation_length_stats = {idx: RunningStats() for idx in engine_indexes}
+        for idx in engine_indexes:
+            self.gauge_prompt_tokens_mean[idx].set(0.0)
+            self.gauge_prompt_tokens_std[idx].set(0.0)
+            self.gauge_generation_tokens_mean[idx].set(0.0)
+            self.gauge_generation_tokens_std[idx].set(0.0)
+
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
             documentation=(
@@ -286,6 +404,24 @@ class PrometheusStatLogger(StatLoggerBase):
         )
         self.counter_prefix_cache_hits = make_per_engine(
             counter_prefix_cache_hits, engine_indexes, model_name
+        )
+
+        counter_kv_cache_lookups = self._counter_cls(
+            name="vllm:kv_cache_lookups_total",
+            documentation=("Total KV cache lookups in tokens, including resumed requests."),
+            labelnames=labelnames,
+        )
+        self.counter_kv_cache_lookups = make_per_engine(
+            counter_kv_cache_lookups, engine_indexes, model_name
+        )
+
+        counter_kv_cache_reused_tokens = self._counter_cls(
+            name="vllm:kv_cache_reused_tokens_total",
+            documentation=("Total tokens served from the KV cache, including resumed requests."),
+            labelnames=labelnames,
+        )
+        self.counter_kv_cache_reused_tokens = make_per_engine(
+            counter_kv_cache_reused_tokens, engine_indexes, model_name
         )
 
         #
@@ -673,6 +809,18 @@ class PrometheusStatLogger(StatLoggerBase):
                     scheduler_stats.kv_cache_usage
                 )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.gauge_gpu_utilization[engine_idx].set(
+                scheduler_stats.gpu_utilization
+            )
+            self.gauge_kv_cache_hit_rate[engine_idx].set(
+                scheduler_stats.kv_cache_hit_rate
+            )
+            self.counter_kv_cache_lookups[engine_idx].inc(
+                scheduler_stats.kv_cache_queries
+            )
+            self.counter_kv_cache_reused_tokens[engine_idx].inc(
+                scheduler_stats.kv_cache_hits
+            )
 
             if self.show_hidden_metrics:
                 self.counter_gpu_prefix_cache_queries[engine_idx].inc(
@@ -721,6 +869,12 @@ class PrometheusStatLogger(StatLoggerBase):
             self.histogram_time_per_output_token[engine_idx].observe(itl)
 
         for finished_request in iteration_stats.finished_requests:
+            self.prompt_length_stats[engine_idx].update(
+                finished_request.num_prompt_tokens
+            )
+            self.generation_length_stats[engine_idx].update(
+                finished_request.num_generation_tokens
+            )
             self.counter_request_success[finished_request.finish_reason][
                 engine_idx
             ].inc()
@@ -752,6 +906,13 @@ class PrometheusStatLogger(StatLoggerBase):
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
                 )
+
+        prompt_stats = self.prompt_length_stats[engine_idx]
+        self.gauge_prompt_tokens_mean[engine_idx].set(prompt_stats.mean)
+        self.gauge_prompt_tokens_std[engine_idx].set(prompt_stats.stddev)
+        generation_stats = self.generation_length_stats[engine_idx]
+        self.gauge_generation_tokens_mean[engine_idx].set(generation_stats.mean)
+        self.gauge_generation_tokens_std[engine_idx].set(generation_stats.stddev)
 
         if self.gauge_lora_info is not None:
             running_lora_adapters = ",".join(

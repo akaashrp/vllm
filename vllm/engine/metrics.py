@@ -67,6 +67,12 @@ class Metrics:
             labelnames=labelnames,
             multiprocess_mode="sum",
         )
+        self.gauge_scheduler_swapped = self._gauge_cls(
+            name="vllm:num_requests_swapped",
+            documentation="Number of requests swapped out.",
+            labelnames=labelnames,
+            multiprocess_mode="sum",
+        )
         self.gauge_lora_info = self._gauge_cls(
             name="vllm:lora_requests_info",
             documentation="Running stats on lora requests.",
@@ -569,6 +575,7 @@ class PrometheusStatLogger(StatLoggerBase):
     def _log_prometheus(self, stats: Stats) -> None:
         # System state data
         self._log_gauge(self.metrics.gauge_scheduler_running, stats.num_running_sys)
+        self._log_gauge(self.metrics.gauge_scheduler_swapped, stats.num_swapped_sys)
         self._log_gauge(self.metrics.gauge_scheduler_waiting, stats.num_waiting_sys)
         self._log_gauge(self.metrics.gauge_gpu_cache_usage, stats.gpu_cache_usage_sys)
         # Including max-lora in metric, in future this property of lora

@@ -1250,10 +1250,18 @@ class Scheduler(SchedulerInterface):
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
+        total_queries = (
+            prefix_cache_stats.queries + prefix_cache_stats.preempted_queries
+        )
+        total_hits = prefix_cache_stats.hits + prefix_cache_stats.preempted_hits
+        hit_rate = (total_hits / total_queries) if total_queries else 0.0
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
+            kv_cache_hit_rate=hit_rate,
+            kv_cache_queries=total_queries,
+            kv_cache_hits=total_hits,
             prefix_cache_stats=prefix_cache_stats,
             spec_decoding_stats=spec_decoding_stats,
             num_corrupted_reqs=sum(req.is_output_corrupted for req in self.running),

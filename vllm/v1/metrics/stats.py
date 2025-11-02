@@ -45,6 +45,10 @@ class SchedulerStats:
     current_wave: int = 0
 
     kv_cache_usage: float = 0.0
+    gpu_utilization: float = 0.0
+    kv_cache_hit_rate: float = 0.0
+    kv_cache_queries: int = 0
+    kv_cache_hits: int = 0
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
 

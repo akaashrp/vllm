@@ -5,6 +5,7 @@
 import copy
 import gc
 import os
+from threading import Lock
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -28,7 +29,7 @@ from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
-from vllm.utils import GiB_bytes, MemorySnapshot, memory_profiling
+from vllm.utils import GiB_bytes, MemorySnapshot, import_pynvml, memory_profiling
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
@@ -44,7 +45,30 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
 
+_pynvml = import_pynvml()
+_NVML_INIT_LOCK = Lock()
+_NVML_INITIALIZED = False
+
+
+def _ensure_nvml_initialized() -> bool:
+    """Lazily initialize NVML for utilization queries."""
+    global _NVML_INITIALIZED
+    if _NVML_INITIALIZED:
+        return True
+    with _NVML_INIT_LOCK:
+        if _NVML_INITIALIZED:
+            return True
+        try:
+            _pynvml.nvmlInit()
+        except Exception as err:  # pragma: no cover - NVML optional
+            logger.debug("Failed to initialize NVML: %s", err)
+            return False
+        _NVML_INITIALIZED = True
+    return True
+
+
 if TYPE_CHECKING:
+
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -144,6 +168,29 @@ class Worker(WorkerBase):
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
+
+    def get_gpu_utilization(self) -> float:
+        if self.device is None or self.device.type != "cuda":
+            return 0.0
+        if not _ensure_nvml_initialized():
+            return 0.0
+        try:
+            physical_id = self.current_platform.device_id_to_physical_device_id(
+                self.local_rank
+            )
+        except Exception as err:  # pragma: no cover - defensive fallback
+            logger.debug("Falling back to local rank for NVML lookup: %s", err)
+            physical_id = self.local_rank
+        try:
+            handle = _pynvml.nvmlDeviceGetHandleByIndex(physical_id)
+            utilization = _pynvml.nvmlDeviceGetUtilizationRates(handle)
+            return float(utilization.gpu) / 100.0
+        except _pynvml.NVMLError as err:  # pragma: no cover - NVML optional
+            logger.debug("Failed to query GPU utilization via NVML: %s", err)
+        except Exception as err:  # pragma: no cover - defensive fallback
+            logger.debug("Unexpected error while reading GPU utilization: %s", err)
+        return 0.0
+
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if self.vllm_config.model_config.enable_sleep_mode:
