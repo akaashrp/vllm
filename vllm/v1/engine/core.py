@@ -53,6 +53,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.scheduler_simulator import SchedulerSimulationWorker
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
@@ -149,6 +150,28 @@ class EngineCore:
             include_finished_set=vllm_config.parallel_config.data_parallel_size > 1,
             log_stats=self.log_stats,
         )
+        
+        self.scheduler_simulator: Optional[SchedulerSimulationWorker] = None
+        if vllm_config.scheduler_config.enable_wait_time_simulation:
+            interval = (
+                vllm_config.scheduler_config.wait_time_simulation_interval_ms / 1000.0
+            )
+            self.scheduler_simulator = SchedulerSimulationWorker(
+                interval_s=interval,
+                # average_prompt_length=self.vllm_config.scheduler_config.average_prompt_length,
+                # average_output_length=self.vllm_config.scheduler_config.average_output_length,
+                # average_max_tokens=self.vllm_config.scheduler_config.average_max_tokens,
+                intercept=self.vllm_config.scheduler_config.simulation_intercept,
+                prefill_coeff=self.vllm_config.scheduler_config.simulation_prefill_coeff,
+                decode_coeff=self.vllm_config.scheduler_config.simulation_decode_coeff,
+            )
+            self.scheduler.set_snapshot_consumer(
+                self.scheduler_simulator.update_snapshot
+            )
+            self.scheduler_simulator.start()
+        else:
+            self.scheduler.set_snapshot_consumer(None)
+        
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(
@@ -398,6 +421,8 @@ class EngineCore:
         return engine_core_outputs, model_executed
 
     def shutdown(self):
+        if self.scheduler_simulator is not None:
+            self.scheduler_simulator.stop()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -434,6 +459,26 @@ class EngineCore:
     def execute_dummy_batch(self):
         self.model_executor.execute_dummy_batch()
 
+    def get_wait_time_report(self, include_timings: bool = False) -> dict:
+        if self.scheduler_simulator is None:
+            return {"enabled": False}
+        result = self.scheduler_simulator.latest_result()
+        if result is None:
+            return {"enabled": True, "ready": False}
+        payload = {
+            "enabled": True,
+            "ready": True,
+            "snapshot_version": result.snapshot_version,
+            "snapshot_timestamp": result.snapshot_timestamp,
+            "simulation_timestamp": result.simulation_timestamp,
+            "num_requests": result.num_requests,
+            "metadata": result.metadata,
+        }
+        if include_timings:
+            payload["snapshot_build_latency_ms"] = result.snapshot_build_latency_ms
+            payload["simulation_latency_ms"] = result.simulation_latency_ms
+        return payload
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_executor.add_lora(lora_request)
 
@@ -463,6 +508,10 @@ class EngineCore:
         args: tuple = (),
         kwargs: Optional[dict[str, Any]] = None,
     ) -> list[_R]:
+        if isinstance(method, str) and method == "get_wait_time_report":
+            fn_kwargs = kwargs or {}
+            result = self.get_wait_time_report(*args, **fn_kwargs)
+            return [result]  # mimic worker return shape
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
     def save_tensorized_model(

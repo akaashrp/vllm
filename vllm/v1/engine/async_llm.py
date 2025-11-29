@@ -763,6 +763,15 @@ class AsyncLLM(EngineClient):
                 custom_stat_loggers=None,
             )
 
+    async def get_wait_time_report(self, include_timings: bool = False):
+        if not hasattr(self.engine_core, "collective_rpc_async"):
+            raise NotImplementedError(
+                "Wait time simulation is not available for this engine"
+            )
+        return await self.engine_core.collective_rpc_async(
+            "get_wait_time_report", args=(include_timings,)
+        )
+
     @property
     def is_running(self) -> bool:
         # Is None before the loop is started.

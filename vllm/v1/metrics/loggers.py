@@ -203,6 +203,48 @@ class LoggingStatLogger(StatLoggerBase):
             )
 
 
+class PerRequestWaitTimeLogger(StatLoggerBase):
+    """Logs per-request wait/latency data for external consumption."""
+
+    def __init__(self, vllm_config: VllmConfig, engine_index: int = 0):
+        self.engine_index = engine_index
+        self.model_name = vllm_config.model_config.served_model_name
+        self._logger = init_logger(__name__)
+
+    def record(
+        self,
+        scheduler_stats: Optional[SchedulerStats],
+        iteration_stats: Optional[IterationStats],
+        engine_idx: int = 0,
+    ):
+        if iteration_stats is None:
+            return
+
+        for finished_req in iteration_stats.finished_requests:
+            req_id = getattr(finished_req, "request_id", "")
+            self._logger.info(
+                (
+                    "vllm.per_request_latency model=%s engine=%s request_id=%s "
+                    "queue_s=%.6f prefill_s=%.6f decode_s=%.6f "
+                    "inference_s=%.6f e2e_s=%.6f"
+                ),
+                self.model_name,
+                engine_idx,
+                req_id,
+                finished_req.queued_time,
+                finished_req.prefill_time,
+                finished_req.decode_time,
+                finished_req.inference_time,
+                finished_req.e2e_latency,
+            )
+
+    def log_engine_initialized(self):
+        pass
+
+    def log(self):
+        pass
+
+
 class PrometheusStatLogger(StatLoggerBase):
     _gauge_cls = prometheus_client.Gauge
     _counter_cls = prometheus_client.Counter

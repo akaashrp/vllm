@@ -7,7 +7,7 @@ import itertools
 import time
 from collections import defaultdict
 from collections.abc import Iterable
-from typing import Any, Union
+from typing import Any, Callable, Optional, Union
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
@@ -27,6 +27,13 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.state_snapshot import (
+    RequestStateSnapshot,
+    SchedulerKVCacheSnapshot,
+    SchedulerParallelSnapshot,
+    SchedulerConfigSnapshot,
+    SchedulerStateSnapshot,
+)
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -59,6 +66,10 @@ class Scheduler(SchedulerInterface):
         self.log_stats = log_stats
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+        self._snapshot_consumer: Optional[
+            Callable[[SchedulerStateSnapshot], None]
+        ] = None
+        self._snapshot_version = 0
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -345,7 +356,7 @@ class Scheduler(SchedulerInterface):
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
 
-        # Next, schedule the WAITING requests.
+        # Next, schedule the WAITING requests (only if no preemptions occurred).
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -353,6 +364,7 @@ class Scheduler(SchedulerInterface):
 
                 request = self.waiting.peek_request()
 
+                # (BODEN): I don't think there's a good way to include this in our simulator
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
@@ -367,6 +379,7 @@ class Scheduler(SchedulerInterface):
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
+                # (BODEN): can we ignore structured outputs / grammar constraining?
                 # Skip request if the structured output request is still waiting
                 # for FSM compilation.
                 if request.status == RequestStatus.WAITING_FOR_FSM:
@@ -464,6 +477,7 @@ class Scheduler(SchedulerInterface):
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
+                    # basically chunking where chunk size = remaining token_budget
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
@@ -665,6 +679,7 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output)
+        self._emit_snapshot()
         return scheduler_output
 
     def _update_after_schedule(
@@ -1161,6 +1176,142 @@ class Scheduler(SchedulerInterface):
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting)
+
+    def set_snapshot_consumer(
+        self, consumer: Optional[Callable[[SchedulerStateSnapshot], None]]
+    ) -> None:
+        """Registers a consumer that receives scheduler state snapshots."""
+        self._snapshot_consumer = consumer
+
+    def _emit_snapshot(self) -> None:
+        if self._snapshot_consumer is None:
+            return
+        snapshot_start = time.perf_counter()
+        snapshot = self._build_state_snapshot()
+        snapshot_elapsed_ms = (time.perf_counter() - snapshot_start) * 1000.0
+        snapshot.build_latency_ms = snapshot_elapsed_ms
+        logger.debug(
+            "Built scheduler snapshot v%04d in %.3f ms",
+            snapshot.version,
+            snapshot_elapsed_ms,
+        )
+        self._snapshot_consumer(snapshot)
+
+    def _build_state_snapshot(self) -> SchedulerStateSnapshot:
+        self._snapshot_version += 1
+        created_at = time.monotonic()
+        requests: dict[str, RequestStateSnapshot] = {}
+        long_threshold = self.scheduler_config.long_prefill_token_threshold
+        
+        max_arrival_time = -1
+        for request_id, request in self.requests.items():
+            kv_blocks = self.kv_cache_manager.get_blocks(request_id)
+            kv_block_counts = tuple(len(block_group) for block_group in kv_blocks.blocks)
+            
+            num_prompt_tokens = request.num_prompt_tokens
+            num_computed_tokens = request.num_computed_tokens
+            num_prompt_processed_tokens = min(num_computed_tokens, num_prompt_tokens)
+            num_output_processed_tokens = request.num_output_tokens
+            
+            # might need to artificially ensure that num_computed_tokens and num_tokens
+            # match expectations (we calculate num_tokens as num_prompt_tokens + decode_processed)
+            
+            num_output_target_tokens = max(num_output_processed_tokens, request.max_tokens // 2) + 1
+            num_output_target_tokens = min(num_output_target_tokens, request.max_tokens, self.max_model_len - num_prompt_tokens)
+            
+            assert num_output_target_tokens > num_output_processed_tokens, "target number of tokens must be greater than processed number of tokens"
+            assert num_output_target_tokens > 0, "target number of tokens must be positive"
+            assert request.num_tokens == num_prompt_tokens + num_output_processed_tokens, "total number of tokens so far mismatch"
+            
+            requests[request_id] = RequestStateSnapshot(
+                request_id=request_id,
+                status=request.status.name,
+                priority=request.priority,
+                arrival_time=request.arrival_time,
+                num_prompt_tokens=num_prompt_tokens,
+                num_computed_tokens=num_computed_tokens,
+                num_output_target_tokens=num_output_target_tokens,
+                num_prompt_processed_tokens=num_prompt_processed_tokens,
+                num_output_processed_tokens=num_output_processed_tokens,
+                max_tokens=request.max_tokens,
+                num_preemptions=request.num_preemptions,
+                num_cached_tokens=request.num_cached_tokens,
+                is_long_prompt=long_threshold > 0 and num_prompt_tokens >= long_threshold,
+                kv_block_counts=kv_block_counts,
+            )
+            max_arrival_time = max(max_arrival_time, request.arrival_time)
+
+        num_prompt_tokens = 1024
+        dummy_request_id = "__DUMMY__"
+        requests[dummy_request_id] = RequestStateSnapshot(
+            request_id=dummy_request_id,
+            status="WAITING",
+            priority=0,
+            arrival_time=max_arrival_time + 1,
+            num_prompt_tokens=num_prompt_tokens,
+            num_computed_tokens=0,
+            num_output_target_tokens=1,
+            num_prompt_processed_tokens=0,
+            num_output_processed_tokens=0,
+            max_tokens=1024,
+            num_preemptions=0,
+            num_cached_tokens=-1,
+            is_long_prompt=long_threshold > 0 and num_prompt_tokens >= long_threshold,
+            kv_block_counts=tuple(0 for _ in self.kv_cache_config.kv_cache_groups)
+        )
+        
+        running_request_ids: list[str] = []
+        waiting_request_ids: list[str] = []
+        
+        if self.scheduler_config.policy == "priority":
+            # Will need to manage a heapq for waiting queue
+            raise NotImplementedError("Priority scheduling not implemented yet")
+        elif self.scheduler_config.policy == "fcfs":
+            running_request_ids = [req.request_id for req in self.running]
+            waiting_request_ids = [req.request_id for req in self.waiting] + [dummy_request_id]
+        
+        # logger.info("Scheduler Snapshot - Running Requests:", running_request_ids)
+        # logger.info("Scheduler Snapshot - Waiting Requests:", waiting_request_ids)
+        
+        block_pool = self.kv_cache_manager.block_pool
+        kv_cache_config_snapshot = SchedulerKVCacheSnapshot(
+            num_gpu_blocks=self.cache_config.num_gpu_blocks,
+            block_size=self.kv_cache_manager.block_size,
+            kv_cache_groups=self.kv_cache_config.kv_cache_groups,
+            kv_cache_usage=self.kv_cache_manager.usage,
+            kv_cache_total_blocks=block_pool.num_gpu_blocks,
+            kv_cache_free_blocks=block_pool.get_num_free_blocks(),
+        )
+        
+        parallel_config_snapshot = SchedulerParallelSnapshot(
+            decode_context_parallel_size=self.dcp_world_size
+        )
+
+        scheduler_config_snapshot = SchedulerConfigSnapshot(
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            max_model_len=self.scheduler_config.max_model_len,
+            # max_num_partial_prefills=self.scheduler_config.max_num_partial_prefills,
+            # max_long_partial_prefills=self.scheduler_config.max_long_partial_prefills,
+            long_prefill_token_threshold=long_threshold,
+            chunked_prefill_enabled=self.scheduler_config.chunked_prefill_enabled,
+            # num_lookahead_slots=self.scheduler_config.num_lookahead_slots,
+            # num_lookahead_tokens=self.num_lookahead_tokens,
+            policy=self.scheduler_config.policy,
+        )
+        
+        return SchedulerStateSnapshot(
+            version=self._snapshot_version,
+            created_at=created_at,
+            num_running=len(self.running),
+            num_waiting=len(self.waiting) + 1,
+            running_request_ids=running_request_ids,
+            waiting_request_ids=waiting_request_ids,
+            requests=requests,
+            config=scheduler_config_snapshot,
+            kv_cache_config=kv_cache_config_snapshot,
+            parallel_config=parallel_config_snapshot,
+        )
 
     def add_request(self, request: Request) -> None:
         self.waiting.add_request(request)

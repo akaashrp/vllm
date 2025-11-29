@@ -88,6 +88,7 @@ class FinishedRequestStats:
     """Stats associated with a finished request."""
 
     finish_reason: "FinishReason"
+    request_id: str = ""
     e2e_latency: float = 0.0
     num_prompt_tokens: int = 0
     num_generation_tokens: int = 0
@@ -189,6 +190,7 @@ class IterationStats:
         num_prompt_tokens: int,
         max_tokens_param: Optional[int],
         req_stats: RequestStateStats,
+        request_id: Optional[str] = None,
     ):
         e2e_latency = self._time_since(req_stats.arrival_time)
 
@@ -215,6 +217,7 @@ class IterationStats:
         )
 
         finished_req = FinishedRequestStats(
+            request_id=request_id or "",
             finish_reason=finish_reason,
             e2e_latency=e2e_latency,
             num_prompt_tokens=num_prompt_tokens,

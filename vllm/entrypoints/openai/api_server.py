@@ -119,6 +119,7 @@ from vllm.utils import (
     set_ulimit,
 )
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.metrics.loggers import PerRequestWaitTimeLogger, StatLoggerFactory
 from vllm.v1.metrics.prometheus import get_prometheus_registry
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -168,6 +169,7 @@ async def build_async_engine_client(
     usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,
     disable_frontend_multiprocessing: Optional[bool] = None,
     client_config: Optional[dict[str, Any]] = None,
+    stat_loggers: Optional[list[StatLoggerFactory]] = None,
 ) -> AsyncIterator[EngineClient]:
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
         # The executor is expected to be mp.
@@ -188,11 +190,15 @@ async def build_async_engine_client(
     if disable_frontend_multiprocessing is None:
         disable_frontend_multiprocessing = bool(args.disable_frontend_multiprocessing)
 
+    if stat_loggers is None and getattr(args, "enable_per_request_wait_logger", False):
+        stat_loggers = [PerRequestWaitTimeLogger]
+
     async with build_async_engine_client_from_engine_args(
         engine_args,
         usage_context=usage_context,
         disable_frontend_multiprocessing=disable_frontend_multiprocessing,
         client_config=client_config,
+        stat_loggers=stat_loggers,
     ) as engine:
         yield engine
 
@@ -204,6 +210,7 @@ async def build_async_engine_client_from_engine_args(
     usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,
     disable_frontend_multiprocessing: bool = False,
     client_config: Optional[dict[str, Any]] = None,
+    stat_loggers: Optional[list[StatLoggerFactory]] = None,
 ) -> AsyncIterator[EngineClient]:
     """
     Create EngineClient, either:
@@ -243,6 +250,7 @@ async def build_async_engine_client_from_engine_args(
             client_addresses=client_config,
             client_count=client_count,
             client_index=client_index,
+            stat_loggers=stat_loggers,
         )
 
         # Don't keep the dummy data in memory
@@ -390,6 +398,29 @@ async def get_server_load_metrics(request: Request):
 async def ping(raw_request: Request) -> Response:
     """Ping check. Endpoint required for SageMaker"""
     return await health(raw_request)
+
+
+@router.get("/wait_time")
+async def wait_time_report(
+    raw_request: Request, include_timings: bool = Query(False)
+):
+    """Expose the latest wait-time simulation report."""
+
+    client = engine_client(raw_request)
+    method = getattr(client, "get_wait_time_report", None)
+    if method is None:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Wait time simulation is not supported by this engine",
+        )
+    try:
+        reports = await method(include_timings)
+    except NotImplementedError as exc:  # pragma: no cover
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    return JSONResponse(content={"reports": reports})
 
 
 @router.post(

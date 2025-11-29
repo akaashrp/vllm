@@ -122,6 +122,13 @@ class SchedulerConfig:
 
     chunked_prefill_enabled: bool = field(init=False)
     """True if chunked prefill is enabled."""
+    
+    """Wait time simulation settings"""
+    enable_wait_time_simulation: bool = True
+    wait_time_simulation_interval_ms: int = 1000
+    simulation_intercept: float = 0.1
+    simulation_prefill_coeff: float = 0.0001
+    simulation_decode_coeff: float = 0.001
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
@@ -314,6 +321,15 @@ class SchedulerConfig:
                 f"max_long_partial_prefills ({self.max_long_partial_prefills}) "
                 "must be greater than or equal to 1 and less than or equal to "
                 f"max_num_partial_prefills ({self.max_num_partial_prefills})."
+            )
+
+        if (
+            self.enable_wait_time_simulation
+            and self.wait_time_simulation_interval_ms <= 0
+        ):
+            raise ValueError(
+                "wait_time_simulation_interval_ms must be greater than 0 when "
+                "enable_wait_time_simulation is True."
             )
 
         return self

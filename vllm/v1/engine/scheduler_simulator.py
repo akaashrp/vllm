@@ -11,10 +11,37 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.state_snapshot import (
+    SchedulerKVCacheSnapshot,
     RequestStateSnapshot,
     SchedulerConfigSnapshot,
     SchedulerStateSnapshot,
 )
+
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, FCFSRequestQueue, PriorityRequestQueue, create_request_queue
+from vllm.v1.request import Request
+from vllm.v1.core.sched.utils import remove_all
+
+"""
+Config files we don't care about:
+1. compilation
+2. device
+3. kv_events
+4. kv_transfer
+5. load
+6. lora
+7. model
+8. multimodal
+9. observability
+10. parallel (only care about dcp_world_size)
+11. pooler
+12. speculative
+13. speech_to_text
+14. structured_outputs
+15. utils
+
+KV cache remote transfers would require estimating remote transfer time
+Speculative decoding would require estimating draft model time per speculative decoding method
+"""
 
 logger = init_logger(__name__)
 
@@ -22,9 +49,9 @@ logger = init_logger(__name__)
 Problems:
 1. KV cache management (different waiting states)
 2. Speculative decoding
-3. Doesn't account for preemptions
-"""
 
+Note: including LoRAs seems relatively trivial
+"""
 
 @dataclass
 class SimulationResult:
@@ -42,36 +69,26 @@ class SimRequestState:
     """Mutable view of an individual request within the simulator."""
 
     snapshot: RequestStateSnapshot
-    virtual_tokens_with_spec: int = field(init=False)
     num_computed_tokens: int = field(init=False)
     prefill_processed: int = field(init=False)
     decode_processed: int = field(init=False)
-    spec_token_count: int = field(init=False)
-    num_output_placeholders: int = field(init=False)
-    decode_tokens_staged: int = field(default=0)
+    num_preemptions: int = field(init=False)
+    num_cached_tokens: int = field(init=False, default=-1)
     first_scheduled_time_ms: Optional[float] = None
     prefill_done_time_ms: Optional[float] = None
     finished_time_ms: Optional[float] = None
 
     def __post_init__(self) -> None:
-        self.virtual_tokens_with_spec = self.snapshot.num_tokens_with_spec
+        self.status = self._normalize_status(self.snapshot.status)
         self.num_computed_tokens = self.snapshot.num_computed_tokens
         self.prefill_processed = self.snapshot.num_prompt_processed_tokens
         self.decode_processed = self.snapshot.num_output_processed_tokens
-        self.spec_token_count = self.snapshot.spec_token_count
-        self.num_output_placeholders = self.snapshot.num_output_placeholders
+        self.num_preemptions = self.snapshot.num_preemptions
+        self.num_cached_tokens = self.snapshot.num_cached_tokens
 
     @property
     def request_id(self) -> str:
         return self.snapshot.request_id
-
-    @property
-    def status(self) -> str:
-        return self.snapshot.status
-
-    @status.setter
-    def status(self, value: str) -> None:
-        self.snapshot.status = value
 
     @property
     def priority(self) -> int:
@@ -82,64 +99,53 @@ class SimRequestState:
         return self.snapshot.arrival_time
 
     @property
+    def num_tokens(self) -> int:
+        return self.snapshot.num_prompt_tokens + self.decode_processed
+
+    @property
     def prefill_remaining(self) -> int:
         return max(0, self.snapshot.num_prompt_tokens - self.prefill_processed)
 
     @property
     def decode_remaining(self) -> int:
-        return max(0, self.snapshot.num_output_tokens - self.decode_processed)
+        return max(
+            0, self.snapshot.num_output_target_tokens - self.decode_processed
+        )
 
     def ensure_decode_backlog(self) -> None:
-        """Stage one decode token if a request still needs decoding."""
-        if self.prefill_remaining > 0:
-            return
-        outstanding = (
-            self.virtual_tokens_with_spec
-            + self.num_output_placeholders
-            - self.num_computed_tokens
-        )
-        available_decode = self.decode_remaining - self.decode_tokens_staged
-        if outstanding <= 0 and available_decode > 0:
-            self.decode_tokens_staged += 1
-            self.virtual_tokens_with_spec += 1
+        # Async scheduling/spec decoding are ignored; nothing to stage.
+        return
 
-    def pending_tokens(self) -> int:
-        return max(
-            0,
-            self.virtual_tokens_with_spec
-            + self.num_output_placeholders
-            - self.num_computed_tokens,
-        )
+    def num_new_tokens(self) -> int:
+        if self.prefill_remaining > 0:
+            return self.prefill_remaining
+        # Decode progresses autoregressively; without spec/async we schedule
+        # at most one decode token per step.
+        return min(1, self.decode_remaining)
 
     def consume(self, num_tokens: int) -> Tuple[int, int]:
-        """Advance per-request progress by consuming scheduled tokens."""
+        """
+        Advance per-request progress by consuming scheduled tokens.
+
+        Mirrors the live scheduler's `_update_after_schedule`: advance
+        `num_computed_tokens` immediately when work is scheduled, but do NOT
+        advance `decode_processed` here. The emitted decode tokens are added
+        later (after the batch "completes") so that `num_tokens` stays ahead
+        of `num_computed_tokens` during decoding, matching the live scheduler's
+        gap of 1 token.
+        """
         prefill_consumed = min(num_tokens, self.prefill_remaining)
-        if prefill_consumed > 0:
+        if prefill_consumed:
             self.prefill_processed += prefill_consumed
             num_tokens -= prefill_consumed
 
-        decode_consumed = 0
-        if num_tokens > 0:
-            decode_consumed = min(num_tokens, self.decode_remaining)
-            if decode_consumed > 0:
-                self.decode_processed += decode_consumed
-                num_tokens -= decode_consumed
-                self.decode_tokens_staged = max(
-                    0, self.decode_tokens_staged - decode_consumed
-                )
-
-        if num_tokens > 0 and self.spec_token_count > 0:
-            spec_consumed = min(num_tokens, self.spec_token_count)
-            self.spec_token_count -= spec_consumed
-            decode_consumed += spec_consumed
-            num_tokens -= spec_consumed
+        decode_consumed = min(num_tokens, self.decode_remaining)
+        if decode_consumed:
+            num_tokens -= decode_consumed
 
         consumed = prefill_consumed + decode_consumed
-        if consumed > 0:
+        if consumed:
             self.num_computed_tokens += consumed
-            if self.num_output_placeholders > 0:
-                placeholder_used = min(self.num_output_placeholders, consumed)
-                self.num_output_placeholders -= placeholder_used
 
         return prefill_consumed, decode_consumed
 
@@ -157,25 +163,25 @@ class SimRequestState:
             self.status = "FINISHED"
 
     def is_finished(self) -> bool:
-        return (
-            self.prefill_remaining == 0
-            and self.decode_remaining == 0
-            and self.pending_tokens() == 0
-            and self.spec_token_count == 0
-        )
+        # return self.status == "FINISHED"
+        return self.prefill_remaining == 0 and self.decode_remaining == 0
 
-    def is_active(self) -> bool:
-        if self.is_finished():
-            return False
-        return "RUNNING" in self.status or "WAITING" in self.status
-
+    @staticmethod
+    def _normalize_status(status: str) -> str:
+        if "WAITING" in status:
+            return "WAITING"
+        if "FINISHED" in status:
+            return "FINISHED"
+        return status
 
 @dataclass
 class SimulationContext:
     snapshot: SchedulerStateSnapshot
     requests: Dict[str, SimRequestState]
-    running_order: List[SimRequestState]
-    waiting_queue: Deque[SimRequestState]
+    running: List[SimRequestState]
+    waiting: Deque[SimRequestState]
+    kv_allocations: Dict[str, List[int]]
+    kv_free_blocks: int
     current_time_ms: float = 0.0
     total_prefill_tokens: int = 0
     total_decode_tokens: int = 0
@@ -184,93 +190,169 @@ class SimulationContext:
     def __init__(self, snapshot: SchedulerStateSnapshot) -> None:
         self.snapshot = snapshot
         self.requests = {
-            req.request_id: SimRequestState(req) for req in snapshot.requests
+            request_id: SimRequestState(req) for request_id, req in snapshot.requests.items()
         }
-        self.running_order = self._build_running_order()
-        self.waiting_queue = self._build_waiting_queue()
+        self.running = self._build_running()
+        self.waiting = self._build_waiting()
+        self.kv_allocations = self._init_kv_allocations()
+        self.kv_free_blocks = snapshot.kv_cache_config.kv_cache_free_blocks
         self.current_time_ms = 0.0
         self.total_prefill_tokens = 0
         self.total_decode_tokens = 0
         self.num_batches = 0
 
-    def _build_running_order(self) -> List[SimRequestState]:
-        running: List[SimRequestState] = []
-        for req_id in self.snapshot.running_request_ids:
-            sim_req = self.requests.get(req_id)
-            if sim_req and sim_req.is_active():
-                running.append(sim_req)
-        return running
-
-    def _build_waiting_queue(self) -> Deque[SimRequestState]:
-        policy = self.snapshot.config.policy
-        queue: Deque[SimRequestState] = deque()
-        ordered_ids = self.snapshot.waiting_request_ids
-        if not ordered_ids:
-            candidates = [
-                req
-                for req in self.requests.values()
-                if "WAITING" in req.status
-                and not req.status.upper().startswith("FINISHED")
-            ]
-            if policy == "priority":
-                candidates.sort(key=lambda r: (r.priority, r.arrival_time))
-            else:
-                candidates.sort(key=lambda r: r.arrival_time)
-            ordered_ids = [req.request_id for req in candidates]
-        for req_id in ordered_ids:
-            sim_req = self.requests.get(req_id)
-            if sim_req and "WAITING" in sim_req.status:
-                queue.append(sim_req)
-        return queue
-
-    def has_pending_requests(self) -> bool:
-        if any(req.is_active() for req in self.running_order):
-            return True
-        return any(req.is_active() for req in self.waiting_queue)
-
-    def remove_finished(self, finished: List[SimRequestState]) -> None:
-        finished_ids = {req.request_id for req in finished}
-        if not finished_ids:
-            return
-        self.running_order = [
-            req for req in self.running_order if req.request_id not in finished_ids
-        ]
-
     def summary_metadata(self) -> dict:
-        per_request: Dict[str, dict] = {}
-        for req in self.requests.values():
-            per_request[req.request_id] = {
-                "status": req.status,
-                "first_token_ms": req.first_scheduled_time_ms,
-                "prefill_done_ms": req.prefill_done_time_ms,
-                "finished_ms": req.finished_time_ms,
-                "remaining_prefill_tokens": req.prefill_remaining,
-                "remaining_decode_tokens": req.decode_remaining,
-            }
+        # per_request = {}
+        # for req in self.requests.values():
+        #     per_request[req.request_id] = {
+        #         "status": req.status,
+        #         "first_token_ms": req.first_scheduled_time_ms,
+        #         "prefill_done_ms": req.prefill_done_time_ms,
+        #         "finished_ms": req.finished_time_ms,
+        #         "remaining_prefill": req.prefill_remaining,
+        #         "remaining_decode": req.decode_remaining,
+        #         # "kv_blocks": self.kv_allocations.get(req.request_id),
+        #     }
         return {
             "num_batches": self.num_batches,
+            "num_running": len(self.running),
+            "num_waiting": len(self.waiting),
             "total_prefill_tokens": self.total_prefill_tokens,
             "total_decode_tokens": self.total_decode_tokens,
-            "per_request": per_request,
-            # "kv_cache": {
-            #     "usage": self.snapshot.kv_cache_usage,
-            #     "total_blocks": self.snapshot.kv_cache_total_blocks,
-            #     "free_blocks": self.snapshot.kv_cache_free_blocks,
-            #     "block_size": self.snapshot.kv_cache_block_size,
-            # },
+            # "kv_free_blocks": self.kv_free_blocks,
+            # "kv_total_blocks": self.snapshot.kv_cache_config.kv_cache_total_blocks,
+            # "per_request": per_request,
         }
 
     def estimate_wait_time_ms(self, request_id: Optional[str] = None) -> float:
-        if request_id:
-            req = self.requests.get(request_id)
-            if req and req.first_scheduled_time_ms is not None:
-                return req.first_scheduled_time_ms
-        for req_id in self.snapshot.waiting_request_ids:
-            req = self.requests.get(req_id)
-            if req and req.first_scheduled_time_ms is not None:
-                return req.first_scheduled_time_ms
+        target_id = request_id or "__DUMMY__"
+        req = self.requests.get(target_id)
+        if req and req.first_scheduled_time_ms is not None:
+            return req.first_scheduled_time_ms
         return 0.0
 
+    def _build_running(self) -> List[SimRequestState]:
+        # running: List[SimRequestState] = []
+        # for req_id in self.snapshot.running_request_ids:
+        #     sim_req = self.requests.get(req_id)
+        #     if not sim_req or sim_req.status == "FINISHED":
+        #         continue
+        #     if sim_req.status == "RUNNING":
+        #         running.append(sim_req)
+        # return running
+        return [self.requests[req_id] for req_id in self.snapshot.running_request_ids]
+
+    def _build_waiting(self) -> Deque[SimRequestState]:
+        # queue: Deque[SimRequestState] = deque()
+        # for req_id in self.snapshot.waiting_request_ids:
+        #     sim_req = self.requests.get(req_id)
+        #     if not sim_req or sim_req.status == "FINISHED":
+        #         continue
+        #     if sim_req.status in ("WAITING", "PREEMPTED"):
+        #         queue.append(sim_req)
+        # return queue
+        return deque([self.requests[req_id] for req_id in self.snapshot.waiting_request_ids])
+
+    def has_pending_requests(self) -> bool:
+        if any(request.status != "FINISHED" for request in self.running):
+            return True
+        return any(request.status != "FINISHED" for request in self.waiting)
+
+    def _init_kv_allocations(self) -> Dict[str, List[int]]:
+        allocs: Dict[str, List[int]] = {}
+        for req in self.requests.values():
+            allocs[req.request_id] = list(req.snapshot.kv_block_counts)
+        return allocs
+
+    @property
+    def num_kv_groups(self) -> int:
+        return len(self.snapshot.kv_cache_config.kv_cache_groups)
+
+    @property
+    def block_size(self) -> int:
+        return self.snapshot.kv_cache_config.block_size
+
+    def allocated_blocks(self, req: SimRequestState) -> List[int]:
+        return self.kv_allocations.get(req.request_id, [0] * self.num_kv_groups)
+
+    def free_request_blocks(self, req: SimRequestState) -> None:
+        current = self.allocated_blocks(req)
+        reclaimed = sum(current)
+        self.kv_free_blocks += reclaimed
+        self.kv_allocations[req.request_id] = [0] * self.num_kv_groups
+
+    def create_empty_block_list(self) -> list[list[int]]:
+        return [[] for _ in range(self.num_kv_groups)]
+
+    def get_computed_blocks(self, req: SimRequestState) -> Tuple[list[list[int]], int]:
+        # Prefix caching/local computed blocks are ignored in the simulator.
+        return self.create_empty_block_list(), 0
+
+    def get_blocks(self, request_id: str) -> List[int]:
+        return self.kv_allocations.get(
+            request_id, [0 for _ in range(self.num_kv_groups)]
+        )
+
+    """
+    Might need to support this call:
+    new_computed_blocks, num_new_local_computed_tokens = (
+        self.kv_cache_manager.get_computed_blocks(request)
+    )
+    """
+    def allocate_slots(
+        self,
+        req: SimRequestState,
+        num_new_tokens: int, # always equal to num_new_tokens for us
+        num_new_computed_tokens: int = 0, # look at condition in scheduler.py
+        new_computed_blocks = None, # look at condition in scheduler.py
+        num_lookahead_tokens = 0, # always 0 for us
+        delay_cache_blocks = False, # always False for us
+        num_encoder_tokens = 0, # always 0 for us
+    ) -> Optional[List[int]]:
+        block_size = self.block_size
+        if block_size <= 0:
+            return None
+
+        current_blocks = self.allocated_blocks(req)
+        total_tokens_after = req.num_computed_tokens + num_new_tokens
+        required_blocks = [
+            (total_tokens_after + block_size - 1) // block_size
+            for _ in range(self.num_kv_groups)
+        ]
+        additional = [max(0, reqd - curr) for reqd, curr in zip(required_blocks, current_blocks)]
+        additional_total = sum(additional)
+
+        if additional_total > self.kv_free_blocks:
+            return None
+
+        # Commit allocation.
+        self.kv_free_blocks -= additional_total
+        new_blocks = [curr + add for curr, add in zip(current_blocks, additional)]
+        self.kv_allocations[req.request_id] = new_blocks
+        return new_blocks
+    
+    def can_allocate_slots(
+        self,
+        req: SimRequestState,
+        num_new_tokens: int,
+    ) -> bool:
+        block_size = self.block_size
+        if block_size <= 0:
+            return False
+
+        current_blocks = self.allocated_blocks(req)
+        total_tokens_after = req.num_computed_tokens + num_new_tokens
+        required_blocks = [
+            (total_tokens_after + block_size - 1) // block_size
+            for _ in range(self.num_kv_groups)
+        ]
+        additional = [max(0, reqd - curr) for reqd, curr in zip(required_blocks, current_blocks)]
+        additional_total = sum(additional)
+
+        if additional_total > self.kv_free_blocks:
+            return False
+
+        return True
 
 class SchedulerSimulationWorker:
     """Runs deterministic simulations based on scheduler snapshots."""
@@ -328,6 +410,13 @@ class SchedulerSimulationWorker:
         while not self._stop_event.is_set():
             sim_elapsed_ms = 0.0
             snapshot = self._pop_latest_snapshot()
+            
+            # logger.info(
+            #     "Num running: %d, Num waiting: %d",
+            #     snapshot.num_running if snapshot else -1,
+            #     snapshot.num_waiting if snapshot else -1,
+            # )
+            
             if snapshot is not None:
                 sim_start = time.perf_counter()
                 result = self._run_simulation(snapshot)
@@ -347,128 +436,229 @@ class SchedulerSimulationWorker:
         logger.info("Scheduler simulation worker stopped")
 
     def _build_next_batch(
-        self, state: SimulationContext
+        self, 
+        state: SimulationContext
     ) -> Tuple[List[SimRequestState], List[int]]:
-        config = state.snapshot.config
-        token_budget = config.max_num_batched_tokens
-        max_model_len = config.max_model_len
         batch_requests: List[SimRequestState] = []
         batch_tokens: List[int] = []
-        partial_prefills = sum(1 for req in state.running_order if req.prefill_remaining)
-        long_partial_prefills = sum(
-            1
-            for req in state.running_order
-            if req.prefill_remaining and req.snapshot.is_long_prompt
-        )
-
-        # Schedule currently running requests first.
-        for req in list(state.running_order):
+        config = state.snapshot.config
+        
+        max_model_len = config.max_model_len
+        
+        scheduled_new_reqs = []
+        scheduled_resumed_reqs = []
+        scheduled_running_reqs = []
+        preempted_reqs = []
+        
+        req_to_new_blocks = {}
+        num_scheduled_tokens = {}
+        token_budget = config.max_num_batched_tokens
+        
+        scheduled_timestamp = time.monotonic()
+        
+        req_index = 0
+        # Schedule RUNNING requests first.
+        while req_index < len(state.running):
+            request = state.running[req_index]
+            
             if token_budget <= 0:
                 break
-            if req.is_finished():
+            if request.is_finished():
                 continue
-            req.ensure_decode_backlog()
-            pending = req.pending_tokens()
-            if pending <= 0:
-                continue
-            tokens = min(pending, token_budget, max_model_len - req.num_computed_tokens)
-            if tokens <= 0:
-                continue
-            prefill_before = req.prefill_remaining
-            if prefill_before > 0 and tokens >= prefill_before:
-                partial_prefills = max(0, partial_prefills - 1)
-                if req.snapshot.is_long_prompt:
-                    long_partial_prefills = max(0, long_partial_prefills - 1)
-            batch_requests.append(req)
-            batch_tokens.append(tokens)
-            token_budget -= tokens
+            
+            num_new_tokens = request.num_tokens - request.num_computed_tokens
+            if num_new_tokens <= 0:
+                raise RuntimeError("Request has no new tokens to schedule")
+            
+            if 0 < config.long_prefill_token_threshold < num_new_tokens:
+                num_new_tokens = config.long_prefill_token_threshold
+            num_new_tokens = min(num_new_tokens, token_budget, max_model_len - request.num_computed_tokens)
 
-        # schedule waiting requests while respecting capacity limits
-        skipped_requests: List[SimRequestState] = []
-        while (
-            token_budget > 0
-            and len(batch_requests) < config.max_num_seqs
-            and state.waiting_queue
-        ):
-            if len(state.running_order) >= config.max_num_seqs:
+            if num_new_tokens <= 0:
+                req_index += 1
+                continue
+            
+            while True:
+                new_blocks = state.allocate_slots(request, num_new_tokens)
+                if new_blocks is not None:
+                    # The request can be scheduled
+                    break
+                
+                # The request cannot be scheduled.
+                # Preempt the lowest-priority request.
+                preempted_req: Optional[SimRequestState] = None
+                if config.policy == "priority":
+                    # preempted_req = max(
+                    #     state.running,
+                    #     key=lambda r: (r.priority, r.arrival_time),
+                    # )
+                    # state.running.remove(preempted_req)
+                    # if preempted_req in scheduled_running_reqs:
+                    #     scheduled_running_reqs.remove(preempted_req)
+                    raise NotImplementedError("Priority scheduling not implemented yet")
+                elif config.policy == "fcfs":
+                    preempted_req = state.running.pop()
+                
+                state.free_request_blocks(preempted_req)
+                preempted_req.status = "PREEMPTED"
+                preempted_req.num_computed_tokens = 0
+                preempted_req.prefill_processed = 0
+                preempted_req.decode_processed = 0
+                preempted_req.num_preemptions += 1
+                
+                if config.policy == "priority":
+                    # state.waiting.append(preempted_req)
+                    raise NotImplementedError("Priority scheduling not implemented yet")
+                elif config.policy == "fcfs":
+                    state.waiting.appendleft(preempted_req)
+                    
+                preempted_reqs.append(preempted_req)
+                if preempted_req == request:
+                    # No more request to preempt. Cannot schedule this request.
+                    break
+                
+            if new_blocks is None:
+                # Could not schedule this request.
                 break
-            req = state.waiting_queue.popleft()
-            if req.is_finished():
-                continue
-            req.ensure_decode_backlog()
-            tokens = self._tokens_for_waiting_request(
-                req,
-                token_budget,
-                config,
-                partial_prefills,
-                long_partial_prefills,
-            )
-            if tokens <= 0:
-                skipped_requests.append(req)
-                continue
-            batch_requests.append(req)
-            batch_tokens.append(tokens)
-            token_budget -= tokens
-            req.status = "RUNNING"
-            if req not in state.running_order:
-                state.running_order.append(req)
-            prefill_remaining = req.prefill_remaining
-            if prefill_remaining > 0 and tokens < prefill_remaining:
-                partial_prefills += 1
-                if req.snapshot.is_long_prompt:
-                    long_partial_prefills += 1
+            
+            scheduled_running_reqs.append(request)
+            req_to_new_blocks[request.request_id] = new_blocks
+            num_scheduled_tokens[request.request_id] = num_new_tokens
+            token_budget -= num_new_tokens
+            req_index += 1
+            
+            batch_requests.append(request)
+            batch_tokens.append(num_new_tokens)
+            
+        # BODEN: handle differently based on FCFS vs priority
+        if config.policy == "priority":
+            raise NotImplementedError("Priority scheduling not implemented yet")
+        elif config.policy == "fcfs":
+            skipped_waiting_requests = deque() 
+        
+        if not preempted_reqs:
+            while state.waiting:
+                request = None # to prevent unbound variable error
+                if token_budget <= 0:
+                    break
+                if len(state.running) == config.max_num_seqs:
+                    break
+                
+                # request = state.waiting.peek_request()
+                if config.policy == "priority":
+                    raise NotImplementedError("Priority scheduling not implemented yet")
+                elif config.policy == "fcfs":
+                    request = state.waiting[0]
+                
+                if request.num_computed_tokens == 0:
+                    # BODEN
+                    new_computed_blocks, num_new_local_computed_tokens = (
+                        state.get_computed_blocks(request)
+                    )
+                    num_computed_tokens = (
+                        num_new_local_computed_tokens
+                    )
+                else:
+                    # BODEN
+                    new_computed_blocks = (
+                        state.create_empty_block_list()
+                    )
+                    num_new_local_computed_tokens = 0
+                    num_computed_tokens = request.num_computed_tokens
 
-        if skipped_requests:
-            # Maintain FCFS semantics by putting skipped items back at the front.
-            state.waiting_queue.extendleft(reversed(skipped_requests))
+                num_new_tokens = request.num_tokens - num_computed_tokens
+                if 0 < config.long_prefill_token_threshold < num_new_tokens:
+                    num_new_tokens = (
+                        config.long_prefill_token_threshold
+                    )
 
+                # no chunked prefill
+                if not config.chunked_prefill_enabled and num_new_tokens > token_budget:
+                    # state.waiting.pop_request()
+                    # skipped_waiting_requests.prepend_request(request)
+                    if config.policy == "priority":
+                        raise NotImplementedError("Priority scheduling not implemented yet")
+                    elif config.policy == "fcfs":
+                        request = state.waiting.popleft()
+                        skipped_waiting_requests.appendleft(request)
+                    
+                    continue
+                
+                num_new_tokens = min(num_new_tokens, token_budget)
+                assert num_new_tokens > 0
+                
+                new_blocks = state.allocate_slots(
+                    request,
+                    num_new_tokens,
+                    num_new_local_computed_tokens,
+                    new_computed_blocks,
+                )
+                
+                if new_blocks is None:
+                    break
+                
+                # request = state.waiting.pop_request()
+                if config.policy == "priority":
+                    raise NotImplementedError("Priority scheduling not implemented yet")
+                elif config.policy == "fcfs":
+                    request = state.waiting.popleft()
+                
+                state.running.append(request)
+                
+                if request.status == "WAITING":
+                    scheduled_new_reqs.append(request)
+                elif request.status == "PREEMPTED":
+                    scheduled_resumed_reqs.append(request)
+                else:
+                    raise RuntimeError(f"Invalid request status: {request.status}")
+                
+                req_to_new_blocks[request.request_id] = (
+                    state.get_blocks(request.request_id)
+                )
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                request.status = "RUNNING"
+                request.num_computed_tokens = num_computed_tokens    
+                if request.num_cached_tokens < 0:
+                    request.num_cached_tokens = num_computed_tokens
+                    
+                batch_requests.append(request)
+                batch_tokens.append(num_new_tokens)
+                
+        if skipped_waiting_requests:
+            if config.policy == "priority":
+                raise NotImplementedError("Priority scheduling not implemented yet")
+            elif config.policy == "fcfs":
+                state.waiting.extendleft(skipped_waiting_requests)
+            
+        # Check if the scheduling constraints are satisfied.
+        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        assert total_num_scheduled_tokens <= config.max_num_batched_tokens
+        assert token_budget >= 0
+        assert len(state.running) <= config.max_num_seqs
+        
+        # Since some requests in the RUNNING queue may not be scheduled in
+        # this step, the total number of schedul`ed requests can be smaller than
+        # len(state.running).
+        assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
+            scheduled_running_reqs
+        ) <= len(state.running)
+
+        # # Get the longest common prefix among all requests in the running queue.
+        # # This can be potentially used for cascade attention.
+        # num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
+        # if self.running:
+        #     any_request = self.running[0]
+        #     num_common_prefix_blocks = (
+        #         self.kv_cache_manager.get_num_common_prefix_blocks(
+        #             any_request, len(self.running)
+        #         )
+        #     )
+        
+        # BODEN: summary metadata is still empty
+            
         return batch_requests, batch_tokens
-
-    def _tokens_for_waiting_request(
-        self,
-        req: SimRequestState,
-        token_budget: int,
-        config: SchedulerConfigSnapshot,
-        partial_prefills: int,
-        long_partial_prefills: int,
-    ) -> int:
-        prefill_remaining = req.prefill_remaining
-        # (BODEN): also needs to use req.max_tokens in computation
-        max_tokens = config.max_model_len - req.num_computed_tokens
-        if max_tokens <= 0:
-            return 0
-
-        if prefill_remaining > 0:
-            tokens = prefill_remaining
-            if (
-                config.long_prefill_token_threshold > 0
-                and tokens > config.long_prefill_token_threshold
-            ):
-                tokens = config.long_prefill_token_threshold
-            if not config.chunked_prefill_enabled and tokens > token_budget:
-                return 0
-            if tokens > token_budget:
-                tokens = token_budget
-            if tokens <= 0:
-                return 0
-            will_complete = tokens >= prefill_remaining
-            if not will_complete:
-                if (
-                    config.max_num_partial_prefills > 0
-                    and partial_prefills >= config.max_num_partial_prefills
-                ):
-                    return 0
-                if (
-                    req.snapshot.is_long_prompt
-                    and config.max_long_partial_prefills > 0
-                    and long_partial_prefills >= config.max_long_partial_prefills
-                ):
-                    return 0
-        else:
-            tokens = min(req.pending_tokens(), token_budget)
-
-        return min(tokens, max_tokens)
-
+        
     def _apply_batch_result(
         self,
         state: SimulationContext,
@@ -479,22 +669,81 @@ class SchedulerSimulationWorker:
         total_decode = 0
         prefill_done: List[SimRequestState] = []
         finished: List[SimRequestState] = []
-        for req, tokens in zip(batch_requests, batch_tokens):
-            prefill_before = req.prefill_remaining
-            decode_before = req.decode_remaining
-            consumed_prefill, consumed_decode = req.consume(tokens)
+        
+        """
+        Need to update: 
+        self.status = self._normalize_status(self.snapshot.status) -> DONE
+        self.num_computed_tokens = self.snapshot.num_computed_tokens -> DONE
+        self.prefill_processed = self.snapshot.num_prompt_processed_tokens -> DONE
+        self.decode_processed = self.snapshot.num_output_processed_tokens -> DONE
+        self.num_preemptions = self.snapshot.num_preemptions -> nothing to do
+        self.num_cached_tokens = self.snapshot.num_cached_tokens -> nothing to do
+        
+        running: List[SimRequestState] -> DONE
+        waiting: Deque[SimRequestState] -> DONE
+        kv_allocations: Dict[str, List[int]] -> DONE
+        kv_free_blocks: int -> DONE
+        current_time_ms: float = 0.0 -> DONE in _run_simulation
+        total_prefill_tokens: int = 0 -> DONE in _run_simulation
+        total_decode_tokens: int = 0 -> DONE in _run_simulation
+        num_batches: int = 0 -> DONE in _run_simulation
+        """
+        
+        config = state.snapshot.config
+        
+        stopped_running_reqs: set[SimRequestState] = set()
+        stopped_preempted_reqs: set[SimRequestState] = set()
+        for request, num_tokens_scheduled in zip(batch_requests, batch_tokens):
+            assert num_tokens_scheduled > 0
+            if request is None:
+                continue
+                    
+            prefill_before = request.prefill_remaining
+            decode_before = request.decode_remaining
+            consumed_prefill, consumed_decode = request.consume(num_tokens_scheduled)
             total_prefill += consumed_prefill
             total_decode += consumed_decode
-            if prefill_before > 0 and req.prefill_remaining == 0:
-                prefill_done.append(req)
+
+            # Simulate emission of decode tokens after the batch finishes:
+            # - The first decode token arrives when prefill completes.
+            # - Each scheduled decode token produces one emitted token.
+            emitted_decode = consumed_decode
             if (
-                decode_before > 0
-                and req.decode_remaining == 0
-                and req.spec_token_count == 0
+                prefill_before > 0
+                and request.prefill_remaining == 0
+                and decode_before > 0
             ):
-                finished.append(req)
-        state.remove_finished(finished)
-        return total_prefill, total_decode, prefill_done, finished
+                emitted_decode += 1
+
+            if emitted_decode:
+                emitted_decode = min(emitted_decode, request.decode_remaining)
+                request.decode_processed += emitted_decode
+
+            if prefill_before > 0 and request.prefill_remaining == 0:
+                prefill_done.append(request)
+            if decode_before > 0 and request.is_finished():
+                status_before_stop = request.status
+                
+                # BODEN: need to clear out KV cache after requests finish
+                state.free_request_blocks(request)
+
+                request.status = "FINISHED"
+                
+                if status_before_stop == "RUNNING":
+                    stopped_running_reqs.add(request)
+                else:
+                    stopped_preempted_reqs.add(request)
+        
+        # Remove the stopped requests from the running and waiting queues.
+        if stopped_running_reqs:
+            state.running = remove_all(state.running, stopped_running_reqs)
+        if stopped_preempted_reqs:
+            if config.policy == "priority":
+                raise NotImplementedError("Priority scheduling not implemented yet")
+            elif config.policy == "fcfs":
+                state.waiting = remove_all(state.waiting, stopped_preempted_reqs)
+
+        return total_prefill, total_decode, prefill_done, stopped_running_reqs.union(stopped_preempted_reqs)
 
     def _estimate_batch_time(self, num_prefill_tokens: int, num_decode_tokens: int, intercept: float, prefill_coeff: float, decode_coeff: float) -> float:
         """Simple deterministic estimate for per-batch latency in milliseconds."""
@@ -503,21 +752,37 @@ class SchedulerSimulationWorker:
 
     def _run_simulation(self, snapshot: SchedulerStateSnapshot) -> SimulationResult:
         simulation_timestamp = time.monotonic()
+        
+        # logger.info("Running simulation for snapshot v%04d with %d running and %d waiting requests, policy=%s",
+        #             snapshot.version,
+        #             snapshot.num_running,
+        #             snapshot.num_waiting,
+        #             snapshot.config.policy,
+        # )
+        # logger.info(snapshot.waiting_request_ids)
+        
         state = SimulationContext(snapshot)
 
         idle_ticks = 0
         max_idle_ticks = 4
-        while state.has_pending_requests():
+        # build batches until dummy request is scheduled
+        # while state.has_pending_requests():
+        while True:
             batch_requests, batch_tokens = self._build_next_batch(state)
+            logger.info("Batch %d: scheduling %d requests with total %d tokens",
+                        state.num_batches,
+                        len(batch_requests),
+                        sum(batch_tokens))
             
-            # Dummy request first scheduled
             if any(req.request_id == "__DUMMY__" for req in batch_requests):
+                # Dummy request has been scheduled; end simulation.
+                logger.info(f"Dummy request scheduled in batch {state.num_batches}; ending simulation")
                 break
             
             if not batch_requests:
                 idle_ticks += 1
                 if idle_ticks >= max_idle_ticks:
-                    logger.debug("Simulation stalled after %d idle ticks", idle_ticks)
+                    logger.info("Simulation stalled after %d idle ticks", idle_ticks)
                     break
                 continue
             idle_ticks = 0
@@ -539,17 +804,19 @@ class SchedulerSimulationWorker:
                 self._decode_coeff,
             )
             end_time = start_time + batch_time
+            
             for req in prefill_done_reqs:
                 req.mark_prefill_done(end_time)
             for req in finished_reqs:
                 req.mark_finished(end_time)
+            
             state.total_prefill_tokens += batch_prefill
             state.total_decode_tokens += batch_decode
             state.current_time_ms = end_time
             state.num_batches += 1
 
         metadata = state.summary_metadata()
-        metadata["estimated_wait_ms"] = state.estimate_wait_time_ms()
+        metadata["estimated_wait_ms"] = state.current_time_ms
         return SimulationResult(
             snapshot_version=snapshot.version,
             snapshot_timestamp=snapshot.created_at,

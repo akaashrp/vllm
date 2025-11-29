@@ -181,6 +181,8 @@ class FrontendArgs:
     enable_log_outputs: bool = False
     """If True, log model outputs (generations).
     Requires --enable-log-requests."""
+    enable_per_request_wait_logger: bool = True
+    """If True, emit per-request wait/latency logs via PerRequestWaitTimeLogger."""
     h11_max_incomplete_event_size: int = H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT
     """Maximum size (bytes) of an incomplete HTTP event (header or body) for
     h11 parser. Helps mitigate header abuse. Default: 4194304 (4 MB)."""
