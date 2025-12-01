@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 import logging
+import os
+import queue
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, Optional, Union
@@ -210,6 +214,12 @@ class PerRequestWaitTimeLogger(StatLoggerBase):
         self.engine_index = engine_index
         self.model_name = vllm_config.model_config.served_model_name
         self._logger = init_logger(__name__)
+        # If set, also append per-request latencies to this file (one line per
+        # request) to avoid losing logs in a limited terminal buffer.
+        self._file_writer = None
+        file_path = os.getenv("VLLM_PER_REQUEST_WAIT_LOG_PATH")
+        if file_path:
+            self._file_writer = _AsyncFileWriter(file_path)
 
     def record(
         self,
@@ -222,27 +232,56 @@ class PerRequestWaitTimeLogger(StatLoggerBase):
 
         for finished_req in iteration_stats.finished_requests:
             req_id = getattr(finished_req, "request_id", "")
-            self._logger.info(
-                (
-                    "vllm.per_request_latency model=%s engine=%s request_id=%s "
-                    "queue_s=%.6f prefill_s=%.6f decode_s=%.6f "
-                    "inference_s=%.6f e2e_s=%.6f"
-                ),
+            message = (
+                "vllm.per_request_latency model=%s engine=%s request_id=%s "
+                "queue_ms=%.6f prefill_s=%.6f decode_s=%.6f "
+                "inference_s=%.6f e2e_s=%.6f"
+            ) % (
                 self.model_name,
                 engine_idx,
                 req_id,
-                finished_req.queued_time,
+                finished_req.queued_time * 1000,
                 finished_req.prefill_time,
                 finished_req.decode_time,
                 finished_req.inference_time,
                 finished_req.e2e_latency,
             )
+            self._logger.info("%s", message)
+            if self._file_writer:
+                self._file_writer.enqueue(message)
 
     def log_engine_initialized(self):
         pass
 
     def log(self):
         pass
+
+
+class _AsyncFileWriter:
+    """Best-effort background writer to avoid blocking the hot path."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._queue: queue.Queue[Optional[str]] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def enqueue(self, message: str) -> None:
+        with contextlib.suppress(Exception):
+            self._queue.put_nowait(message)
+
+    def _run(self):
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                while True:
+                    msg = self._queue.get()
+                    if msg is None:
+                        break
+                    f.write(msg + "\n")
+                    f.flush()
+        except Exception:
+            # Best-effort; drop messages on failure.
+            return
 
 
 class PrometheusStatLogger(StatLoggerBase):

@@ -3,6 +3,10 @@
 """Background worker that consumes scheduler snapshots and runs simulation."""
 
 from __future__ import annotations
+import cProfile
+import io
+import os
+import pstats
 import threading
 import time
 from collections import deque
@@ -53,6 +57,59 @@ Problems:
 Note: including LoRAs seems relatively trivial
 """
 
+
+class SimulationProfiler:
+    """Optional cProfile hook controlled by env vars.
+
+    Enable by setting VLLM_SIM_PROFILE=1. Results are written to
+    VLLM_SIM_PROFILE_OUT (default: scheduler_sim.prof). Set
+    VLLM_SIM_PROFILE_PRINT=N to also log the top-N cumulative entries.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = bool(os.getenv("VLLM_SIM_PROFILE"))
+        self.output_path = os.getenv("VLLM_SIM_PROFILE_OUT", "scheduler_sim.prof")
+        self.print_limit = int(os.getenv("VLLM_SIM_PROFILE_PRINT", "0"))
+        self.profiler: Optional[cProfile.Profile] = None
+
+    def __enter__(self) -> "SimulationProfiler":
+        if self.enabled:
+            self.profiler = cProfile.Profile()
+            self.profiler.enable()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if not self.profiler:
+            return False
+
+        self.profiler.disable()
+        stats = pstats.Stats(self.profiler)
+        if os.path.exists(self.output_path):
+            try:
+                stats.add(pstats.Stats(self.output_path))
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "Failed to merge existing simulator profile %s: %s",
+                    self.output_path,
+                    exc,
+                )
+        stats.dump_stats(self.output_path)
+
+        if self.print_limit > 0:
+            buffer = io.StringIO()
+            stats.stream = buffer
+            stats.sort_stats(pstats.SortKey.CUMULATIVE).print_stats(self.print_limit)
+            logger.info(
+                "Scheduler simulator profile (top %d, saved to %s):\n%s",
+                self.print_limit,
+                self.output_path,
+                buffer.getvalue(),
+            )
+        else:
+            logger.info("Scheduler simulator profile saved to %s", self.output_path)
+        return False
+
+
 @dataclass
 class SimulationResult:
     snapshot_version: int
@@ -85,10 +142,28 @@ class SimRequestState:
         self.decode_processed = self.snapshot.num_output_processed_tokens
         self.num_preemptions = self.snapshot.num_preemptions
         self.num_cached_tokens = self.snapshot.num_cached_tokens
+        
+        # logger.info(
+        #     "Initialized SimRequestState for request %s: status=%s, num_computed_tokens=%d, prefill_processed=%d, decode_processed=%d",
+        #     self.request_id,
+        #     self.status,
+        #     self.num_computed_tokens,
+        #     self.prefill_processed,
+        #     self.decode_processed,
+        # )
 
     @property
     def request_id(self) -> str:
         return self.snapshot.request_id
+
+    def __hash__(self) -> int:
+        # Requests are uniquely identified by request_id.
+        return hash(self.request_id)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SimRequestState):
+            return False
+        return self.request_id == other.request_id
 
     @property
     def priority(self) -> int:
@@ -122,6 +197,21 @@ class SimRequestState:
         # Decode progresses autoregressively; without spec/async we schedule
         # at most one decode token per step.
         return min(1, self.decode_remaining)
+
+    def ensure_decode_backlog(self) -> None:
+        """
+        The live scheduler always maintains a 1-token gap during decoding
+        (num_tokens_with_spec == num_computed_tokens + 1) because the next
+        token is emitted after compute. Snapshots may collapse this gap
+        (num_tokens == num_computed_tokens), especially if captured right
+        after prefill. Reintroduce the gap logically so the simulator will
+        schedule the next decode token even when the snapshot shows no gap.
+        """
+        if self.prefill_remaining == 0 and self.decode_remaining > 0:
+            target_prefix = self.snapshot.num_prompt_tokens + self.decode_processed
+            if self.num_computed_tokens >= target_prefix:
+                # Force a logical 1-token backlog for scheduling.
+                self.num_computed_tokens = target_prefix - 1
 
     def consume(self, num_tokens: int) -> Tuple[int, int]:
         """
@@ -403,10 +493,10 @@ class SchedulerSimulationWorker:
             return snapshot
 
     def _run(self) -> None:
-        logger.info(
-            "Scheduler simulation worker started with %.3f s cadence",
-            self._interval_s,
-        )
+        # logger.info(
+        #     "Scheduler simulation worker started with %.3f s cadence",
+        #     self._interval_s,
+        # )
         while not self._stop_event.is_set():
             sim_elapsed_ms = 0.0
             snapshot = self._pop_latest_snapshot()
@@ -419,7 +509,8 @@ class SchedulerSimulationWorker:
             
             if snapshot is not None:
                 sim_start = time.perf_counter()
-                result = self._run_simulation(snapshot)
+                with SimulationProfiler():
+                    result = self._run_simulation(snapshot)
                 sim_elapsed_ms = (time.perf_counter() - sim_start) * 1000.0
                 result.simulation_latency_ms = sim_elapsed_ms
                 result.snapshot_build_latency_ms = snapshot.build_latency_ms
@@ -433,7 +524,7 @@ class SchedulerSimulationWorker:
             
             if sim_elapsed_ms < self._interval_s * 1000.0:
                 self._stop_event.wait(self._interval_s - sim_elapsed_ms / 1000.0)
-        logger.info("Scheduler simulation worker stopped")
+        # logger.info("Scheduler simulation worker stopped")
 
     def _build_next_batch(
         self, 
@@ -460,6 +551,7 @@ class SchedulerSimulationWorker:
         # Schedule RUNNING requests first.
         while req_index < len(state.running):
             request = state.running[req_index]
+            request.ensure_decode_backlog()
             
             if token_budget <= 0:
                 break
@@ -469,6 +561,7 @@ class SchedulerSimulationWorker:
             num_new_tokens = request.num_tokens - request.num_computed_tokens
             if num_new_tokens <= 0:
                 raise RuntimeError("Request has no new tokens to schedule")
+                # logger.info("Request %s has no new tokens to schedule: num_computed_tokens=%d, num_tokens=%d", request.request_id, request.num_computed_tokens, request.num_tokens)
             
             if 0 < config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = config.long_prefill_token_threshold
@@ -549,6 +642,7 @@ class SchedulerSimulationWorker:
                     raise NotImplementedError("Priority scheduling not implemented yet")
                 elif config.policy == "fcfs":
                     request = state.waiting[0]
+                request.ensure_decode_backlog()
                 
                 if request.num_computed_tokens == 0:
                     # BODEN
@@ -713,6 +807,7 @@ class SchedulerSimulationWorker:
                 and request.prefill_remaining == 0
                 and decode_before > 0
             ):
+                # logger.info("Request %s prefill completed; emitting first decode token", request.request_id)
                 emitted_decode += 1
 
             if emitted_decode:
@@ -769,21 +864,21 @@ class SchedulerSimulationWorker:
         # while state.has_pending_requests():
         while True:
             batch_requests, batch_tokens = self._build_next_batch(state)
-            logger.info("Batch %d: scheduling %d requests with total %d tokens",
-                        state.num_batches,
-                        len(batch_requests),
-                        sum(batch_tokens))
+            # logger.info("Batch %d: scheduling %d requests with total %d tokens",
+            #             state.num_batches,
+            #             len(batch_requests),
+            #             sum(batch_tokens))
             
             if any(req.request_id == "__DUMMY__" for req in batch_requests):
                 # Dummy request has been scheduled; end simulation.
-                logger.info(f"Dummy request scheduled in batch {state.num_batches}; ending simulation")
+                # logger.info(f"Dummy request scheduled in batch {state.num_batches}; ending simulation")
                 break
             
             if not batch_requests:
                 idle_ticks += 1
                 if idle_ticks >= max_idle_ticks:
-                    logger.info("Simulation stalled after %d idle ticks", idle_ticks)
-                    break
+                    # logger.info("Simulation stalled after %d idle ticks", idle_ticks)
+                    raise RuntimeError("Simulation stalled: no requests can be scheduled")
                 continue
             idle_ticks = 0
 

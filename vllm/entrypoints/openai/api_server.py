@@ -191,6 +191,7 @@ async def build_async_engine_client(
         disable_frontend_multiprocessing = bool(args.disable_frontend_multiprocessing)
 
     if stat_loggers is None and getattr(args, "enable_per_request_wait_logger", False):
+        args.disable_log_stats = False
         stat_loggers = [PerRequestWaitTimeLogger]
 
     async with build_async_engine_client_from_engine_args(
