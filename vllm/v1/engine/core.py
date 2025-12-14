@@ -189,7 +189,15 @@ class EngineCore:
         # to eliminate pipeline bubbles.
         self.batch_queue_size = self.model_executor.max_concurrent_batches
         self.batch_queue: Optional[
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput]]
+            deque[
+                tuple[
+                    Future[ModelRunnerOutput],
+                    SchedulerOutput,
+                    Optional[float],
+                    Optional[float],
+                    Optional[float],
+                ]
+            ]
         ] = None
         if self.batch_queue_size > 1:
             logger.info("Batch queue is enabled with size %d", self.batch_queue_size)
@@ -213,6 +221,7 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        self._last_schedule_ts: Optional[float] = None
 
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
@@ -335,13 +344,28 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        schedule_start = time.monotonic()
+        batch_interval_s = (
+            0.0
+            if self._last_schedule_ts is None
+            else schedule_start - self._last_schedule_ts
+        )
         scheduler_output = self.scheduler.schedule()
+        schedule_time_s = time.monotonic() - schedule_start
+        self._last_schedule_ts = schedule_start
+
+        execute_start = time.monotonic()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output,
         )
+        batch_execute_time_s = time.monotonic() - execute_start
         engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
+            scheduler_output,
+            model_output,
+            batch_schedule_time_s=schedule_time_s,
+            batch_execute_time_s=batch_execute_time_s,
+            batch_interval_s=batch_interval_s,
         )  # type: ignore
 
         gpu_utilization = 0.0
@@ -387,10 +411,31 @@ class EngineCore:
         assert len(batch_queue) < self.batch_queue_size
 
         model_executed = False
+        schedule_time_s: Optional[float] = None
+        batch_interval_s: Optional[float] = None
+        execute_start_s: Optional[float] = None
         if self.scheduler.has_requests():
+            schedule_start = time.monotonic()
+            batch_interval_s = (
+                0.0
+                if self._last_schedule_ts is None
+                else schedule_start - self._last_schedule_ts
+            )
             scheduler_output = self.scheduler.schedule()
+            schedule_time_s = time.monotonic() - schedule_start
+            self._last_schedule_ts = schedule_start
+
+            execute_start_s = time.monotonic()
             future = self.model_executor.execute_model(scheduler_output, non_block=True)
-            batch_queue.appendleft((future, scheduler_output))  # type: ignore[arg-type]
+            batch_queue.appendleft(
+                (
+                    future,
+                    scheduler_output,
+                    schedule_time_s,
+                    batch_interval_s,
+                    execute_start_s,
+                )
+            )  # type: ignore[arg-type]
 
             model_executed = scheduler_output.total_num_scheduled_tokens > 0
             if (
@@ -409,13 +454,21 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output = batch_queue.pop()
+        future, scheduler_output, schedule_time_s, batch_interval_s, execute_start_s = (
+            batch_queue.pop()
+        )
+        exec_start = execute_start_s if execute_start_s is not None else time.monotonic()
         model_output = self.execute_model_with_error_logging(
             lambda _: future.result(), scheduler_output
         )
+        batch_execute_time_s = time.monotonic() - exec_start
 
         engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
+            scheduler_output,
+            model_output,
+            batch_schedule_time_s=schedule_time_s,
+            batch_execute_time_s=batch_execute_time_s,
+            batch_interval_s=batch_interval_s,
         )
 
         return engine_core_outputs, model_executed

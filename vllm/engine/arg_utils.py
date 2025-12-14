@@ -476,6 +476,11 @@ class EngineArgs:
     collect_detailed_traces: Optional[list[DetailedTraceModules]] = (
         ObservabilityConfig.collect_detailed_traces
     )
+    batch_stats_file: Optional[str] = ObservabilityConfig.batch_stats_file
+    batch_stats_flush_interval_s: float = (
+        ObservabilityConfig.batch_stats_flush_interval_s
+    )
+    batch_stats_queue_size: int = ObservabilityConfig.batch_stats_queue_size
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: Union[str, type[object]] = SchedulerConfig.scheduler_cls
 
@@ -949,6 +954,17 @@ class EngineArgs:
         observability_group.add_argument(
             "--collect-detailed-traces",
             **observability_kwargs["collect_detailed_traces"],
+        )
+        observability_group.add_argument(
+            "--batch-stats-file", **observability_kwargs["batch_stats_file"]
+        )
+        observability_group.add_argument(
+            "--batch-stats-flush-interval-s",
+            **observability_kwargs["batch_stats_flush_interval_s"],
+        )
+        observability_group.add_argument(
+            "--batch-stats-queue-size",
+            **observability_kwargs["batch_stats_queue_size"],
         )
 
         # Scheduler arguments
@@ -1549,6 +1565,9 @@ class EngineArgs:
             show_hidden_metrics_for_version=(self.show_hidden_metrics_for_version),
             otlp_traces_endpoint=self.otlp_traces_endpoint,
             collect_detailed_traces=self.collect_detailed_traces,
+            batch_stats_file=self.batch_stats_file,
+            batch_stats_flush_interval_s=self.batch_stats_flush_interval_s,
+            batch_stats_queue_size=self.batch_stats_queue_size,
         )
 
         config = VllmConfig(

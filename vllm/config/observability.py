@@ -45,6 +45,15 @@ class ObservabilityConfig:
     Note that collecting detailed timing information for each request can be
     expensive."""
 
+    batch_stats_file: Optional[str] = None
+    """If set, write per-batch scheduler stats to this file asynchronously."""
+
+    batch_stats_flush_interval_s: float = 1.0
+    """Flush interval for the batch stats writer thread."""
+
+    batch_stats_queue_size: int = 1024
+    """Max queue size for batch stats records; entries are coalesced if full."""
+
     @cached_property
     def collect_model_forward_time(self) -> bool:
         """Whether to collect model forward time for the request."""

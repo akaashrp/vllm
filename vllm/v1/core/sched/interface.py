@@ -45,6 +45,9 @@ class SchedulerInterface(ABC):
         self,
         scheduler_output: "SchedulerOutput",
         model_runner_output: "ModelRunnerOutput",
+        batch_schedule_time_s: Optional[float] = None,
+        batch_execute_time_s: Optional[float] = None,
+        batch_interval_s: Optional[float] = None,
     ) -> dict[int, "EngineCoreOutputs"]:
         """Update the scheduler state based on the model runner output.
 

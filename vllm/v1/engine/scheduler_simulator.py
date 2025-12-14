@@ -276,6 +276,8 @@ class SimulationContext:
     total_prefill_tokens: int = 0
     total_decode_tokens: int = 0
     num_batches: int = 0
+    queued_at_snapshot: int = 0
+    running_at_snapshot: int = 0
 
     def __init__(self, snapshot: SchedulerStateSnapshot) -> None:
         self.snapshot = snapshot
@@ -284,6 +286,9 @@ class SimulationContext:
         }
         self.running = self._build_running()
         self.waiting = self._build_waiting()
+        self.running_at_snapshot = len(snapshot.running_request_ids)
+        # exclude dummy request for snapshot count
+        self.queued_at_snapshot = max(len(snapshot.waiting_request_ids) - 1, 0)
         self.kv_allocations = self._init_kv_allocations()
         self.kv_free_blocks = snapshot.kv_cache_config.kv_cache_free_blocks
         self.current_time_ms = 0.0
@@ -307,6 +312,8 @@ class SimulationContext:
             "num_batches": self.num_batches,
             "num_running": len(self.running),
             "num_waiting": len(self.waiting),
+            "running_at_snapshot": self.running_at_snapshot,
+            "queued_at_snapshot": self.queued_at_snapshot,
             "total_prefill_tokens": self.total_prefill_tokens,
             "total_decode_tokens": self.total_decode_tokens,
             # "kv_free_blocks": self.kv_free_blocks,
@@ -869,6 +876,7 @@ class SchedulerSimulationWorker:
             #             len(batch_requests),
             #             sum(batch_tokens))
             
+            # set of batch request ids
             if any(req.request_id == "__DUMMY__" for req in batch_requests):
                 # Dummy request has been scheduled; end simulation.
                 # logger.info(f"Dummy request scheduled in batch {state.num_batches}; ending simulation")
@@ -883,8 +891,8 @@ class SchedulerSimulationWorker:
             idle_ticks = 0
 
             start_time = state.current_time_ms
-            for req in batch_requests:
-                req.mark_scheduled(start_time)
+            # for req in batch_requests:
+            #     req.mark_scheduled(start_time)
             (
                 batch_prefill,
                 batch_decode,
@@ -900,8 +908,8 @@ class SchedulerSimulationWorker:
             )
             end_time = start_time + batch_time
             
-            for req in prefill_done_reqs:
-                req.mark_prefill_done(end_time)
+            # for req in prefill_done_reqs:
+            #     req.mark_prefill_done(end_time)
             for req in finished_reqs:
                 req.mark_finished(end_time)
             

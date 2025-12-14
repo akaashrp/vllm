@@ -39,6 +39,24 @@ class SchedulerStats:
 
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
+    
+    # Per-batch token counts (scheduled this step).
+    batch_total_tokens: int = 0
+    batch_prefill_tokens: int = 0
+    batch_decode_tokens: int = 0
+    batch_prefill_tokens_sq: int = 0
+    batch_decode_tokens_sq: int = 0
+
+    # Per-batch timings (seconds).
+    batch_execute_time_s: float = 0.0
+    batch_schedule_time_s: float = 0.0
+    batch_interval_s: float = 0.0
+    # Per-batch context stats.
+    batch_num_active_seqs: int = 0
+    batch_total_context_len: int = 0
+    batch_sq_sum_context_len: int = 0
+    batch_avg_context_len: float = 0.0
+    batch_max_context_len: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0

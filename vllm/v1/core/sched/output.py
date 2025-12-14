@@ -162,5 +162,17 @@ class SchedulerOutput:
     # the bitmask for the whole batch
     grammar_bitmask: npt.NDArray[np.int32] | None
 
+    # Batch-level token counts for this scheduler step.
+    batch_prefill_tokens: int = 0
+    batch_prefill_tokens_sq: int = 0
+    batch_decode_tokens: int = 0
+    batch_decode_tokens_sq: int = 0
+    # Batch-level context stats for scheduled requests.
+    batch_num_active_seqs: int = 0
+    batch_total_context_len: int = 0
+    batch_sq_sum_context_len: int = 0
+    batch_avg_context_len: float = 0.0
+    batch_max_context_len: int = 0
+
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None

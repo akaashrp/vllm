@@ -188,6 +188,19 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
+    @staticmethod
+    def _split_prefill_decode_tokens(
+        prompt_len: int, start_pos: int, num_tokens: int
+    ) -> tuple[int, int]:
+        """Return (prefill_tokens, decode_tokens) for scheduled range."""
+        if num_tokens <= 0:
+            return 0, 0
+        prefill_end = min(prompt_len, start_pos + num_tokens)
+        prefill_start = min(prompt_len, start_pos)
+        prefill = max(0, prefill_end - prefill_start)
+        decode = num_tokens - prefill
+        return prefill, decode
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -207,6 +220,14 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        batch_prefill_tokens = 0
+        batch_prefill_tokens_sq = 0
+        batch_decode_tokens = 0
+        batch_decode_tokens_sq = 0
+        batch_num_active_seqs = 0
+        batch_total_context_len = 0
+        batch_sq_sum_context_len = 0
+        batch_max_context_len = 0
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -317,6 +338,18 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
+            prefill, decode = self._split_prefill_decode_tokens(
+                request.num_prompt_tokens, request.num_computed_tokens, num_new_tokens
+            )
+            batch_prefill_tokens += prefill
+            batch_prefill_tokens_sq += prefill * prefill
+            batch_decode_tokens += decode
+            batch_decode_tokens_sq += decode * decode
+            ctx_len = len(request.all_token_ids)
+            batch_num_active_seqs += 1
+            batch_total_context_len += ctx_len
+            batch_sq_sum_context_len += ctx_len * ctx_len
+            batch_max_context_len = max(batch_max_context_len, ctx_len)
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -572,6 +605,18 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.get_blocks(request.request_id)
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
+                prefill, decode = self._split_prefill_decode_tokens(
+                    request.num_prompt_tokens, num_computed_tokens, num_new_tokens
+                )
+                batch_prefill_tokens += prefill
+                batch_prefill_tokens_sq += prefill * prefill
+                batch_decode_tokens += decode
+                batch_decode_tokens_sq += decode * decode
+                ctx_len = len(request.all_token_ids)
+                batch_num_active_seqs += 1
+                batch_total_context_len += ctx_len
+                batch_sq_sum_context_len += ctx_len * ctx_len
+                batch_max_context_len = max(batch_max_context_len, ctx_len)
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -640,6 +685,19 @@ class Scheduler(SchedulerInterface):
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
+            batch_prefill_tokens=batch_prefill_tokens,
+            batch_prefill_tokens_sq=batch_prefill_tokens_sq,
+            batch_decode_tokens=batch_decode_tokens,
+            batch_decode_tokens_sq=batch_decode_tokens_sq,
+            batch_num_active_seqs=batch_num_active_seqs,
+            batch_total_context_len=batch_total_context_len,
+            batch_sq_sum_context_len=batch_sq_sum_context_len,
+            batch_avg_context_len=(
+                batch_total_context_len / batch_num_active_seqs
+                if batch_num_active_seqs
+                else 0.0
+            ),
+            batch_max_context_len=batch_max_context_len,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
@@ -926,6 +984,9 @@ class Scheduler(SchedulerInterface):
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
+        batch_schedule_time_s: float | None = None,
+        batch_execute_time_s: float | None = None,
+        batch_interval_s: float | None = None,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
@@ -940,6 +1001,17 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats = (
             kv_connector_output.kv_connector_stats if kv_connector_output else None
         )
+
+        batch_prefill_tokens = scheduler_output.batch_prefill_tokens
+        batch_prefill_tokens_sq = scheduler_output.batch_prefill_tokens_sq
+        batch_decode_tokens = scheduler_output.batch_decode_tokens
+        batch_decode_tokens_sq = scheduler_output.batch_decode_tokens_sq
+        batch_total_tokens = scheduler_output.total_num_scheduled_tokens
+        batch_num_active_seqs = scheduler_output.batch_num_active_seqs
+        batch_total_context_len = scheduler_output.batch_total_context_len
+        batch_sq_sum_context_len = scheduler_output.batch_sq_sum_context_len
+        batch_avg_context_len = scheduler_output.batch_avg_context_len
+        batch_max_context_len = scheduler_output.batch_max_context_len
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
@@ -1093,7 +1165,23 @@ class Scheduler(SchedulerInterface):
             finished_req_ids.clear()
 
         if (
-            stats := self.make_stats(spec_decoding_stats, kv_connector_stats)
+            stats := self.make_stats(
+                spec_decoding_stats,
+                kv_connector_stats,
+                batch_prefill_tokens=batch_prefill_tokens,
+                batch_prefill_tokens_sq=batch_prefill_tokens_sq,
+                batch_decode_tokens=batch_decode_tokens,
+                batch_decode_tokens_sq=batch_decode_tokens_sq,
+                batch_total_tokens=batch_total_tokens,
+                batch_schedule_time_s=batch_schedule_time_s,
+                batch_execute_time_s=batch_execute_time_s,
+                batch_interval_s=batch_interval_s,
+                batch_num_active_seqs=batch_num_active_seqs,
+                batch_total_context_len=batch_total_context_len,
+                batch_sq_sum_context_len=batch_sq_sum_context_len,
+                batch_avg_context_len=batch_avg_context_len,
+                batch_max_context_len=batch_max_context_len,
+            )
         ) is not None:
             # Return stats to only one of the front-ends.
             if (eco := next(iter(engine_core_outputs.values()), None)) is None:
@@ -1218,6 +1306,8 @@ class Scheduler(SchedulerInterface):
             
             num_output_target_tokens = max(num_output_processed_tokens, request.max_tokens // 2) + 1
             num_output_target_tokens = min(num_output_target_tokens, request.max_tokens, self.max_model_len - num_prompt_tokens)
+            # num_output_target_tokens = min(request.max_tokens, self.max_model_len - num_prompt_tokens)
+            # num_output_target_tokens = 8192
             
             assert num_output_target_tokens > num_output_processed_tokens, "target number of tokens must be greater than processed number of tokens"
             assert num_output_target_tokens > 0, "target number of tokens must be positive"
@@ -1250,10 +1340,10 @@ class Scheduler(SchedulerInterface):
             arrival_time=max_arrival_time + 1,
             num_prompt_tokens=num_prompt_tokens,
             num_computed_tokens=0,
-            num_output_target_tokens=1,
+            num_output_target_tokens=1024,
             num_prompt_processed_tokens=0,
             num_output_processed_tokens=0,
-            max_tokens=1024,
+            max_tokens=2048,
             num_preemptions=0,
             num_cached_tokens=-1,
             is_long_prompt=long_threshold > 0 and num_prompt_tokens >= long_threshold,
@@ -1396,6 +1486,19 @@ class Scheduler(SchedulerInterface):
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,
         kv_connector_stats: KVConnectorStats | None = None,
+        batch_prefill_tokens: int = 0,
+        batch_prefill_tokens_sq: int = 0,
+        batch_decode_tokens: int = 0,
+        batch_decode_tokens_sq: int = 0,
+        batch_total_tokens: int = 0,
+        batch_schedule_time_s: float | None = None,
+        batch_execute_time_s: float | None = None,
+        batch_interval_s: float | None = None,
+        batch_num_active_seqs: int = 0,
+        batch_total_context_len: int = 0,
+        batch_sq_sum_context_len: int = 0,
+        batch_avg_context_len: float = 0.0,
+        batch_max_context_len: int = 0,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -1409,6 +1512,19 @@ class Scheduler(SchedulerInterface):
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
+            batch_total_tokens=batch_total_tokens,
+            batch_prefill_tokens=batch_prefill_tokens,
+            batch_prefill_tokens_sq=batch_prefill_tokens_sq,
+            batch_decode_tokens=batch_decode_tokens,
+            batch_decode_tokens_sq=batch_decode_tokens_sq,
+            batch_schedule_time_s=batch_schedule_time_s or 0.0,
+            batch_execute_time_s=batch_execute_time_s or 0.0,
+            batch_interval_s=batch_interval_s or 0.0,
+            batch_num_active_seqs=batch_num_active_seqs,
+            batch_total_context_len=batch_total_context_len,
+            batch_sq_sum_context_len=batch_sq_sum_context_len,
+            batch_avg_context_len=batch_avg_context_len,
+            batch_max_context_len=batch_max_context_len,
             kv_cache_usage=self.kv_cache_manager.usage,
             kv_cache_hit_rate=hit_rate,
             kv_cache_queries=total_queries,

@@ -179,7 +179,10 @@ class LoggingStatLogger(StatLoggerBase):
             "GPU util: %.1f%%, GPU KV cache usage: %.1f%%, "
             "Prefix cache hit rate: %.1f%% (step: %.1f%%), "
             "Avg prompt len: %.1f±%.1f tokens, "
-            "Avg generation len: %.1f±%.1f tokens",
+            "Avg generation len: %.1f±%.1f tokens, "
+            "Batch tokens (prefill/decode/total): %d/%d/%d, "
+            "Batch tokens squared (prefill/decode): %d/%d, "
+            "Batch times (sched/exec/interval): %.3f/%.3f/%.3f s",
             self.engine_index,
             prompt_throughput,
             generation_throughput,
@@ -193,6 +196,14 @@ class LoggingStatLogger(StatLoggerBase):
             prompt_len_std,
             generation_len_mean,
             generation_len_std,
+            scheduler_stats.batch_prefill_tokens,
+            scheduler_stats.batch_decode_tokens,
+            scheduler_stats.batch_total_tokens,
+            scheduler_stats.batch_prefill_tokens_sq,
+            scheduler_stats.batch_decode_tokens_sq,
+            scheduler_stats.batch_schedule_time_s,
+            scheduler_stats.batch_execute_time_s,
+            scheduler_stats.batch_interval_s,
         )
         self.spec_decoding_logging.log(log_fn=log_fn)
         self.kv_connector_logging.log(log_fn=log_fn)
@@ -1013,6 +1024,128 @@ class PrometheusStatLogger(StatLoggerBase):
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
 
 
+class AsyncBatchFileStatLogger(StatLoggerBase):
+    """Asynchronously write per-batch stats to a file without blocking sched."""
+
+    _FLUSH_BATCH = 64
+
+    def __init__(self, vllm_config: VllmConfig, engine_index: int = 0):
+        self.engine_index = engine_index
+        obs = vllm_config.observability_config
+        self.file_path = obs.batch_stats_file
+        self.enabled = self.file_path is not None
+        if not self.enabled:
+            # No-op logger when not configured.
+            return
+
+        self.flush_interval = max(obs.batch_stats_flush_interval_s, 0.1)
+        self.queue = queue.Queue(maxsize=max(1, obs.batch_stats_queue_size))
+        self._stop = threading.Event()
+        self._buffer: list[str] = []
+        self._last_flush = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        # Open file in append mode; line buffering keeps writes cheap.
+        self._fh = open(self.file_path, "a", buffering=1, encoding="utf-8")
+        self._thread.start()
+
+    def __del__(self):
+        self._shutdown()
+
+    def _shutdown(self):
+        if not self.enabled:
+            return
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+        self._flush(force=True)
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+    def _coalescing_put(self, entry: str) -> None:
+        """Drop oldest entry if queue is full to stay non-blocking."""
+        try:
+            self.queue.put_nowait(entry)
+            return
+        except queue.Full:
+            try:
+                _ = self.queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self.queue.put_nowait(entry)
+            except queue.Full:
+                # Drop if still full.
+                pass
+
+    def record(
+        self,
+        scheduler_stats: Optional[SchedulerStats],
+        iteration_stats: Optional[IterationStats],
+        engine_idx: int = 0,
+    ):
+        if not self.enabled or scheduler_stats is None:
+            return
+        ts = time.time()
+        entry = (
+            f"{ts:.6f},"
+            f"{engine_idx},"
+            f"{scheduler_stats.batch_prefill_tokens},"
+            f"{scheduler_stats.batch_prefill_tokens_sq},"
+            f"{scheduler_stats.batch_decode_tokens},"
+            f"{scheduler_stats.batch_decode_tokens_sq},"
+            f"{scheduler_stats.batch_total_tokens},"
+            f"{scheduler_stats.batch_schedule_time_s:.6f},"
+            f"{scheduler_stats.batch_execute_time_s:.6f},"
+            f"{scheduler_stats.batch_interval_s:.6f},"
+            f"{scheduler_stats.batch_num_active_seqs},"
+            f"{scheduler_stats.batch_total_context_len},"
+            f"{scheduler_stats.batch_sq_sum_context_len},"
+            f"{scheduler_stats.batch_avg_context_len:.6f},"
+            f"{scheduler_stats.batch_max_context_len}\n"
+        )
+        self._coalescing_put(entry)
+
+    def _flush(self, force: bool = False):
+        if not self.enabled or (not force and not self._buffer):
+            return
+        try:
+            self._fh.writelines(self._buffer)
+            self._fh.flush()
+        except Exception as e:
+            logger.exception("Error flushing batch stats to file: %s", e)
+            pass
+        finally:
+            self._buffer.clear()
+            self._last_flush = time.monotonic()
+
+    def _run(self):
+        while not self._stop.is_set() or not self.queue.empty():
+            try:
+                item = self.queue.get(timeout=self.flush_interval)
+                self._buffer.append(item)
+            except queue.Empty:
+                pass
+
+            now = time.monotonic()
+            if self._buffer and (
+                len(self._buffer) >= self._FLUSH_BATCH
+                or (now - self._last_flush) >= self.flush_interval
+                or self._stop.is_set()
+            ):
+                self._flush()
+
+    def log(self):
+        # No periodic logging; writer thread handles flushing.
+        return
+
+    def log_engine_initialized(self):
+        return
+
+
 PromMetric = Union[
     prometheus_client.Gauge,
     prometheus_client.Counter,
@@ -1079,6 +1212,10 @@ class StatLoggerManager:
         factories: list[StatLoggerFactory] = []
         if custom_stat_loggers is not None:
             factories.extend(custom_stat_loggers)
+
+        obs_cfg = vllm_config.observability_config
+        if obs_cfg.batch_stats_file:
+            factories.append(AsyncBatchFileStatLogger)
 
         if enable_default_loggers and logger.isEnabledFor(logging.INFO):
             if client_count > 1:
