@@ -53,7 +53,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
-from vllm.v1.engine.scheduler_simulator import SchedulerSimulationWorker
+from vllm.v1.engine.scheduler_simulator import PythonSchedulerSimulationWorker, NativeSchedulerSimulationWorker, SchedulerSimulationWorker
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
@@ -151,7 +151,7 @@ class EngineCore:
             log_stats=self.log_stats,
         )
         
-        self.scheduler_simulator: Optional[SchedulerSimulationWorker] = None
+        self.scheduler_simulator: Optional[PythonSchedulerSimulationWorker | NativeSchedulerSimulationWorker] = None
         if vllm_config.scheduler_config.enable_wait_time_simulation:
             interval = (
                 vllm_config.scheduler_config.wait_time_simulation_interval_ms / 1000.0

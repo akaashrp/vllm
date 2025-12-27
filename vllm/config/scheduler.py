@@ -124,11 +124,11 @@ class SchedulerConfig:
     """True if chunked prefill is enabled."""
     
     """Wait time simulation settings"""
-    enable_wait_time_simulation: bool = False
+    enable_wait_time_simulation: bool = True
     wait_time_simulation_interval_ms: int = 100
-    simulation_intercept: float = 0.01
-    simulation_prefill_coeff: float = 0.0000333
-    simulation_decode_coeff: float = 0.000185
+    simulation_intercept: float = 0.024916565263221085
+    simulation_prefill_coeff: float = 0.000025313877177891524
+    simulation_decode_coeff: float = 0.000042442247775970685
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

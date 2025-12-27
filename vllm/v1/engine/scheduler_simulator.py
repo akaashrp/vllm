@@ -9,9 +9,10 @@ import os
 import pstats
 import threading
 import time
+from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple, Type
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.state_snapshot import (
@@ -24,6 +25,10 @@ from vllm.v1.core.sched.state_snapshot import (
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, FCFSRequestQueue, PriorityRequestQueue, create_request_queue
 from vllm.v1.request import Request
 from vllm.v1.core.sched.utils import remove_all
+from vllm.v1.core.sched.snapshot_serialization import (
+    encode_scheduler_state_snapshot,
+    decode_scheduler_state_snapshot,
+)
 
 """
 Config files we don't care about:
@@ -48,6 +53,12 @@ Speculative decoding would require estimating draft model time per speculative d
 """
 
 logger = init_logger(__name__)
+
+try:
+    from vllm.v1.engine import _scheduler_sim as _scheduler_sim_native
+except ImportError:
+    logger.info("Native scheduler simulator module not found")
+    _scheduler_sim_native = None
 
 """
 Problems:
@@ -451,20 +462,17 @@ class SimulationContext:
 
         return True
 
-class SchedulerSimulationWorker:
+class PythonSchedulerSimulationWorker:
     """Runs deterministic simulations based on scheduler snapshots."""
 
-    def __init__(self, interval_s: float, 
-                #  average_prompt_length: float,
-                #  average_output_length: float, 
-                #  average_max_tokens: float,
-                 intercept: float, 
-                 prefill_coeff: float,
-                 decode_coeff: float) -> None:
+    def __init__(
+        self,
+        interval_s: float,
+        intercept: float,
+        prefill_coeff: float,
+        decode_coeff: float,
+    ) -> None:
         self._interval_s = max(interval_s, 0.001)
-        # self._average_prompt_length = average_prompt_length
-        # self._average_output_length = average_output_length
-        # self._average_max_tokens = average_max_tokens
         self._intercept = intercept
         self._prefill_coeff = prefill_coeff
         self._decode_coeff = decode_coeff
@@ -854,49 +862,27 @@ class SchedulerSimulationWorker:
 
     def _run_simulation(self, snapshot: SchedulerStateSnapshot) -> SimulationResult:
         simulation_timestamp = time.monotonic()
-        
-        # logger.info("Running simulation for snapshot v%04d with %d running and %d waiting requests, policy=%s",
-        #             snapshot.version,
-        #             snapshot.num_running,
-        #             snapshot.num_waiting,
-        #             snapshot.config.policy,
-        # )
-        # logger.info(snapshot.waiting_request_ids)
-        
         state = SimulationContext(snapshot)
 
         idle_ticks = 0
         max_idle_ticks = 4
-        # build batches until dummy request is scheduled
-        # while state.has_pending_requests():
         while True:
             batch_requests, batch_tokens = self._build_next_batch(state)
-            # logger.info("Batch %d: scheduling %d requests with total %d tokens",
-            #             state.num_batches,
-            #             len(batch_requests),
-            #             sum(batch_tokens))
-            
-            # set of batch request ids
             if any(req.request_id == "__DUMMY__" for req in batch_requests):
-                # Dummy request has been scheduled; end simulation.
-                # logger.info(f"Dummy request scheduled in batch {state.num_batches}; ending simulation")
                 break
             
             if not batch_requests:
                 idle_ticks += 1
                 if idle_ticks >= max_idle_ticks:
-                    # logger.info("Simulation stalled after %d idle ticks", idle_ticks)
                     raise RuntimeError("Simulation stalled: no requests can be scheduled")
                 continue
             idle_ticks = 0
 
             start_time = state.current_time_ms
-            # for req in batch_requests:
-            #     req.mark_scheduled(start_time)
             (
                 batch_prefill,
                 batch_decode,
-                prefill_done_reqs,
+                _,
                 finished_reqs,
             ) = self._apply_batch_result(state, batch_requests, batch_tokens)
             batch_time = self._estimate_batch_time(
@@ -908,8 +894,6 @@ class SchedulerSimulationWorker:
             )
             end_time = start_time + batch_time
             
-            # for req in prefill_done_reqs:
-            #     req.mark_prefill_done(end_time)
             for req in finished_reqs:
                 req.mark_finished(end_time)
             
@@ -927,3 +911,83 @@ class SchedulerSimulationWorker:
             num_requests=len(snapshot.requests),
             metadata=metadata,
         )
+
+
+class NativeSchedulerSimulationWorker:
+    """Wrapper around the C++ scheduler simulation worker."""
+
+    def __init__(
+        self,
+        interval_s: float,
+        intercept: float,
+        prefill_coeff: float,
+        decode_coeff: float,
+    ) -> None:
+        if _scheduler_sim_native is None:
+            raise RuntimeError(
+                "Native scheduler simulator extension is not available."
+            )
+        self._worker = _scheduler_sim_native.SchedulerSimulationWorker(
+            interval_s=interval_s,
+            intercept=intercept,
+            prefill_coeff=prefill_coeff,
+            decode_coeff=decode_coeff,
+        )
+        logger.info("Scheduler simulator using native backend")
+
+    def start(self) -> None:
+        self._worker.start()
+
+    def stop(self) -> None:
+        self._worker.stop()
+
+    def update_snapshot(self, snapshot: SchedulerStateSnapshot) -> None:
+        serialized = encode_scheduler_state_snapshot(snapshot)
+        self._worker.update_snapshot(serialized)
+
+    def latest_result(self) -> Optional[SimulationResult]:
+        summary = self._worker.latest_result_summary()
+        if summary is None:
+            return None
+        (
+            snapshot_version,
+            snapshot_timestamp,
+            simulation_timestamp,
+            num_requests,
+            snapshot_build_latency_ms,
+            simulation_latency_ms,
+            metadata,
+        ) = summary
+        result = SimulationResult(
+            snapshot_version=snapshot_version,
+            snapshot_timestamp=snapshot_timestamp,
+            simulation_timestamp=simulation_timestamp,
+            num_requests=num_requests,
+            metadata=metadata,
+        )
+        result.snapshot_build_latency_ms = snapshot_build_latency_ms
+        result.simulation_latency_ms = simulation_latency_ms
+        return result
+
+    def latest_snapshot(self) -> Optional[dict]:
+        snapshot_bytes = self._worker.latest_snapshot()
+        if snapshot_bytes is None:
+            return None
+        return decode_scheduler_state_snapshot(snapshot_bytes)
+
+    def clear_latest_snapshot(self) -> None:
+        self._worker.clear_latest_snapshot()
+
+    def clear_latest_result(self) -> None:
+        self._worker.clear_latest_result()
+
+    def run_simulation(self, snapshot: SchedulerStateSnapshot) -> dict:
+        serialized = encode_scheduler_state_snapshot(snapshot)
+        return self._worker.run_simulation_for_test(serialized)
+
+
+SchedulerSimulationWorker: Type[Any]
+if _scheduler_sim_native is not None:
+    SchedulerSimulationWorker = NativeSchedulerSimulationWorker
+else:
+    SchedulerSimulationWorker = PythonSchedulerSimulationWorker

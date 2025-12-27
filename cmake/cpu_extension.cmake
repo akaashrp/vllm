@@ -310,3 +310,21 @@ define_gpu_extension_target(
 )
 
 message(STATUS "Enabling C extension.")
+
+set(VLLM_SCHEDULER_SIM_SRC
+    "csrc/scheduler_sim/bindings.cpp")
+
+define_gpu_extension_target(
+    _scheduler_sim
+    DESTINATION vllm/v1/engine
+    LANGUAGE CXX
+    SOURCES ${VLLM_SCHEDULER_SIM_SRC}
+    WITH_SOABI
+)
+if (TARGET _scheduler_sim)
+    target_link_options(
+        _scheduler_sim
+        PRIVATE "-static-libstdc++" "-static-libgcc")
+endif()
+
+message(STATUS "Enabling scheduler simulator extension.")

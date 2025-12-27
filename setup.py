@@ -88,7 +88,7 @@ def is_url_available(url: str) -> bool:
 
 class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=True, **kwa)
+        super().__init__(name, sources=[], **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
@@ -232,7 +232,8 @@ class cmake_build_ext(build_ext):
         targets = []
 
         def target_name(s: str) -> str:
-            return s.removeprefix("vllm.").removeprefix("vllm_flash_attn.")
+            # Extension targets are registered with their module basename.
+            return s.split(".")[-1]
 
         # Build all the extensions
         for ext in self.extensions:
@@ -298,15 +299,30 @@ class cmake_build_ext(build_ext):
             self.copy_file(file, dst_file)
 
 
-class precompiled_build_ext(build_ext):
-    """Disables extension building when using precompiled binaries."""
+class precompiled_build_ext(cmake_build_ext):
+    """
+    Build only the extensions that are not provided by the precompiled wheel.
+    Currently this is limited to the scheduler simulator bindings.
+    """
+
+    _REQUIRED_TARGETS = {"vllm.v1.engine._scheduler_sim"}
+
+    def _filter_extensions(self) -> list[Extension]:
+        return [ext for ext in self.extensions if ext.name in self._REQUIRED_TARGETS]
 
     def run(self) -> None:
         assert _is_cuda(), "VLLM_USE_PRECOMPILED is only supported for CUDA builds"
+        buildable = self._filter_extensions()
+        if not buildable:
+            print("Skipping build_ext: using precompiled extensions.")
+            return
 
-    def build_extensions(self) -> None:
-        print("Skipping build_ext: using precompiled extensions.")
-        return
+        original_extensions = self.extensions
+        self.extensions = buildable
+        try:
+            super().run()
+        finally:
+            self.extensions = original_extensions
 
 
 class precompiled_wheel_utils:
@@ -642,6 +658,7 @@ if _is_cuda():
 
 if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
+    ext_modules.append(CMakeExtension(name="vllm.v1.engine._scheduler_sim"))
 
 package_data = {
     "vllm": [
