@@ -553,13 +553,17 @@ class SimulationContext {
     auto& current_blocks = get_blocks(req.request_id());
     int64_t total_tokens_after = req.num_computed_tokens() + num_new_tokens;
     int64_t group_count = num_kv_groups();
-    std::vector<int64_t> required(static_cast<size_t>(group_count), 0);
+    size_t required_size = static_cast<size_t>(group_count);
+    ensure_block_scratch(required_size);
+    auto& required = block_requirement_scratch_;
+    auto& additional = block_additional_scratch_;
+    std::fill_n(required.begin(), required_size, int64_t{0});
+    std::fill_n(additional.begin(), required_size, int64_t{0});
     for (int64_t i = 0; i < group_count; ++i) {
       size_t idx = static_cast<size_t>(i);
       required[idx] =
           (total_tokens_after + block_size - 1) / block_size;
     }
-    std::vector<int64_t> additional(static_cast<size_t>(group_count), 0);
     int64_t additional_total = 0;
     for (int64_t i = 0; i < group_count; ++i) {
       size_t idx = static_cast<size_t>(i);
@@ -586,7 +590,10 @@ class SimulationContext {
     const auto& current_blocks = get_blocks(req.request_id());
     int64_t total_tokens_after = req.num_computed_tokens() + num_new_tokens;
     int64_t group_count = num_kv_groups();
-    std::vector<int64_t> required(static_cast<size_t>(group_count), 0);
+    size_t required_size = static_cast<size_t>(group_count);
+    ensure_block_scratch(required_size);
+    auto& required = block_requirement_scratch_;
+    std::fill_n(required.begin(), required_size, int64_t{0});
     int64_t additional_total = 0;
     for (int64_t i = 0; i < group_count; ++i) {
       size_t idx = static_cast<size_t>(i);
@@ -622,6 +629,17 @@ class SimulationContext {
   int64_t num_batches_;
   int64_t queued_at_snapshot_ = 0;
   int64_t running_at_snapshot_ = 0;
+  std::vector<int64_t> block_requirement_scratch_;
+  std::vector<int64_t> block_additional_scratch_;
+
+  void ensure_block_scratch(size_t count) {
+    if (block_requirement_scratch_.size() < count) {
+      block_requirement_scratch_.resize(count);
+    }
+    if (block_additional_scratch_.size() < count) {
+      block_additional_scratch_.resize(count);
+    }
+  }
 };
 
 struct SimulationMetadataNative {
@@ -665,28 +683,15 @@ void RemoveAll(Container& container,
   if (targets.empty()) {
     return;
   }
-  std::unordered_set<SimRequestState*> target_set(targets.begin(),
-                                                  targets.end());
-  container.erase(
-      std::remove_if(container.begin(), container.end(),
-                     [&](SimRequestState* item) {
-                       return target_set.count(item) > 0;
-                     }),
-      container.end());
-}
+  thread_local std::vector<SimRequestState*> removal_scratch;
+  removal_scratch.assign(targets.begin(), targets.end());
+  std::sort(removal_scratch.begin(), removal_scratch.end());
 
-template <>
-void RemoveAll(std::deque<SimRequestState*>& container,
-               const std::vector<SimRequestState*>& targets) {
-  if (targets.empty()) {
-    return;
-  }
-  std::unordered_set<SimRequestState*> target_set(targets.begin(),
-                                                  targets.end());
   container.erase(
       std::remove_if(container.begin(), container.end(),
                      [&](SimRequestState* item) {
-                       return target_set.count(item) > 0;
+                       return std::binary_search(removal_scratch.begin(),
+                                                 removal_scratch.end(), item);
                      }),
       container.end());
 }
@@ -706,8 +711,13 @@ static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
   std::vector<SimRequestState*> scheduled_resumed_reqs;
   std::vector<SimRequestState*> scheduled_running_reqs;
   std::vector<SimRequestState*> preempted_reqs;
-  std::unordered_map<std::string, std::vector<int64_t>> req_to_new_blocks;
-  std::unordered_map<std::string, int64_t> num_scheduled_tokens;
+  std::vector<std::pair<SimRequestState*, std::vector<int64_t>>>
+      req_to_new_blocks;
+  const size_t prealloc =
+      static_cast<size_t>(std::max<int64_t>(int64_t{0}, config.max_num_seqs));
+  req_to_new_blocks.reserve(prealloc);
+  std::vector<int64_t> scheduled_token_counts;
+  scheduled_token_counts.reserve(prealloc);
 
   int64_t token_budget = config.max_num_batched_tokens;
   size_t req_index = 0;
@@ -791,8 +801,8 @@ static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
     }
 
     scheduled_running_reqs.push_back(request);
-    req_to_new_blocks[request->request_id()] = *new_blocks;
-    num_scheduled_tokens[request->request_id()] = num_new_tokens;
+    req_to_new_blocks.emplace_back(request, std::move(*new_blocks));
+    scheduled_token_counts.push_back(num_new_tokens);
     token_budget -= num_new_tokens;
     ++req_index;
 
@@ -886,9 +896,9 @@ static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
                                  request->status());
       }
 
-      req_to_new_blocks[request->request_id()] =
-          state.get_blocks(request->request_id());
-      num_scheduled_tokens[request->request_id()] = num_new_tokens;
+      req_to_new_blocks.emplace_back(request,
+                                     state.get_blocks(request->request_id()));
+      scheduled_token_counts.push_back(num_new_tokens);
       token_budget -= num_new_tokens;
       request->set_status("RUNNING");
       request->set_num_computed_tokens(num_computed_tokens);
@@ -913,8 +923,8 @@ static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
   }
 
   int64_t total_num_scheduled_tokens = 0;
-  for (const auto& entry : num_scheduled_tokens) {
-    total_num_scheduled_tokens += entry.second;
+  for (int64_t tokens : scheduled_token_counts) {
+    total_num_scheduled_tokens += tokens;
   }
   if (total_num_scheduled_tokens > config.max_num_batched_tokens) {
     throw std::runtime_error(
