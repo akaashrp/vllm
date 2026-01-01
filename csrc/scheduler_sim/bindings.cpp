@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -1439,21 +1440,23 @@ class SchedulerSimulationWorkerStub {
     latest_snapshot_bytes_ = snapshot_bytes;
     MsgpackParser parser(latest_snapshot_bytes_.data(),
                          latest_snapshot_bytes_.size());
-    MsgpackValue parsed = parser.parse();
-    parsed_snapshot_ = ParseSchedulerSnapshot(parsed);
+    auto parsed_snapshot =
+        std::make_shared<SchedulerStateSnapshotNative>(
+            ParseSchedulerSnapshot(parser.parse()));
     has_snapshot_ = true;
 
     PendingInfo info;
-    info.version = parsed_snapshot_->version;
-    info.snapshot_timestamp = parsed_snapshot_->created_at;
+    info.version = parsed_snapshot->version;
+    info.snapshot_timestamp = parsed_snapshot->created_at;
     info.num_requests =
-        static_cast<int64_t>(parsed_snapshot_->requests.size());
-    info.build_latency_ms = parsed_snapshot_->build_latency_ms;
-    auto snapshot_native = *parsed_snapshot_;
+        static_cast<int64_t>(parsed_snapshot->requests.size());
+    info.build_latency_ms = parsed_snapshot->build_latency_ms;
+
+    parsed_snapshot_ = parsed_snapshot;
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      pending_snapshot_ = std::move(snapshot_native);
+      pending_snapshot_ = parsed_snapshot;
       pending_info_ = info;
     }
     cv_.notify_all();
@@ -1495,6 +1498,10 @@ class SchedulerSimulationWorkerStub {
   void clear_latest_snapshot() {
     latest_snapshot_bytes_.clear();
     has_snapshot_ = false;
+    parsed_snapshot_.reset();
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_snapshot_.reset();
+    pending_info_.reset();
   }
   void clear_latest_result() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1549,12 +1556,12 @@ class SchedulerSimulationWorkerStub {
 
   void RunLoop() {
     while (true) {
-      std::optional<SchedulerStateSnapshotNative> snapshot;
+      std::shared_ptr<const SchedulerStateSnapshotNative> snapshot;
       PendingInfo info;
       {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&] {
-          return stop_flag_ || pending_snapshot_.has_value();
+          return stop_flag_ || static_cast<bool>(pending_snapshot_);
         });
         if (stop_flag_) {
           break;
@@ -1619,13 +1626,13 @@ class SchedulerSimulationWorkerStub {
   double decode_coeff_;
   bool has_snapshot_ = false;
   std::string latest_snapshot_bytes_;
-  std::optional<SchedulerStateSnapshotNative> parsed_snapshot_;
+  std::shared_ptr<const SchedulerStateSnapshotNative> parsed_snapshot_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   bool stop_flag_ = false;
   bool worker_started_ = false;
   std::thread worker_thread_;
-  std::optional<SchedulerStateSnapshotNative> pending_snapshot_;
+  std::shared_ptr<const SchedulerStateSnapshotNative> pending_snapshot_;
   std::optional<PendingInfo> pending_info_;
   std::optional<SimulationOutcome> latest_outcome_;
 };
