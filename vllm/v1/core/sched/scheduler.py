@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import itertools
+import math
 import time
-from collections import defaultdict
+from bisect import bisect_left, insort
+from collections import defaultdict, deque
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import Any, Callable, Optional, Union
 
 from vllm.config import VllmConfig
@@ -69,7 +72,16 @@ class Scheduler(SchedulerInterface):
         self._snapshot_consumer: Optional[
             Callable[[SchedulerStateSnapshot], None]
         ] = None
+        self._snapshot_consumer_interval_s: Optional[float] = None
+        self._next_snapshot_emit_time: float = 0.0
         self._snapshot_version = 0
+        # Online positive residuals of (actual_decode_tokens - predicted_decode_tokens),
+        # used to inflate decode targets under uncertain long-tail workloads.
+        self._decode_tail_residual_samples: deque[float] = deque()
+        self._decode_tail_residual_sorted: list[float] = []
+        self._decode_tail_residual_max_samples = 4096
+        self._decode_tail_min_samples = 200
+        self._decode_tail_alpha = 1.25
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -121,6 +133,18 @@ class Scheduler(SchedulerInterface):
         # original_block_size × dcp_world_size.
         if self.dcp_world_size > 1:
             self.block_size *= self.dcp_world_size
+
+        self._config_snapshot_template = SchedulerConfigSnapshot(
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            max_model_len=self.scheduler_config.max_model_len,
+            long_prefill_token_threshold=self.scheduler_config.long_prefill_token_threshold,
+            chunked_prefill_enabled=self.scheduler_config.chunked_prefill_enabled,
+            policy=self.scheduler_config.policy,
+        )
+        self._parallel_snapshot_template = SchedulerParallelSnapshot(
+            decode_context_parallel_size=self.dcp_world_size
+        )
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
@@ -1266,13 +1290,26 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def set_snapshot_consumer(
-        self, consumer: Optional[Callable[[SchedulerStateSnapshot], None]]
+        self,
+        consumer: Optional[Callable[[SchedulerStateSnapshot], None]],
+        interval_s: Optional[float] = None,
     ) -> None:
         """Registers a consumer that receives scheduler state snapshots."""
         self._snapshot_consumer = consumer
+        if consumer is None:
+            self._snapshot_consumer_interval_s = None
+            self._next_snapshot_emit_time = 0.0
+        else:
+            self._snapshot_consumer_interval_s = interval_s
+            self._next_snapshot_emit_time = time.monotonic()
 
     def _emit_snapshot(self) -> None:
-        if self._snapshot_consumer is None:
+        consumer = self._snapshot_consumer
+        if consumer is None:
+            return
+        interval = self._snapshot_consumer_interval_s
+        current_time = time.monotonic()
+        if interval is not None and current_time < self._next_snapshot_emit_time:
             return
         snapshot_start = time.perf_counter()
         snapshot = self._build_state_snapshot()
@@ -1283,36 +1320,219 @@ class Scheduler(SchedulerInterface):
             snapshot.version,
             snapshot_elapsed_ms,
         )
-        self._snapshot_consumer(snapshot)
+        consumer(snapshot)
+        if interval is not None:
+            self._next_snapshot_emit_time = time.monotonic() + interval
+
+    def _append_decode_tail_residual(self, residual_tokens: float) -> None:
+        if not math.isfinite(residual_tokens) or residual_tokens < 0:
+            return
+
+        max_samples = self._decode_tail_residual_max_samples
+        if len(self._decode_tail_residual_samples) >= max_samples:
+            oldest = self._decode_tail_residual_samples.popleft()
+            idx = bisect_left(self._decode_tail_residual_sorted, oldest)
+            if (
+                idx < len(self._decode_tail_residual_sorted)
+                and self._decode_tail_residual_sorted[idx] == oldest
+            ):
+                self._decode_tail_residual_sorted.pop(idx)
+
+        self._decode_tail_residual_samples.append(residual_tokens)
+        insort(self._decode_tail_residual_sorted, residual_tokens)
+
+    def _record_decode_tail_residual(self, request: Request) -> None:
+        if request.status not in (
+            RequestStatus.FINISHED_STOPPED,
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+        ):
+            return
+
+        prediction = request.output_length_prediction
+        if prediction is None:
+            return
+
+        predicted_total = int(math.ceil(prediction.mean_tokens))
+        if predicted_total <= 0:
+            return
+
+        residual = float(max(0, request.num_output_tokens - predicted_total))
+        self._append_decode_tail_residual(residual)
+
+    def _decode_residual_quantile(self, q: float) -> float:
+        n = len(self._decode_tail_residual_sorted)
+        if n < self._decode_tail_min_samples:
+            return 0.0
+        q = min(max(float(q), 0.0), 1.0)
+        idx = int(math.ceil(q * n)) - 1
+        idx = min(max(idx, 0), n - 1)
+        return float(self._decode_tail_residual_sorted[idx])
+
+    @staticmethod
+    def _decode_floor_tokens(
+        kv_usage: float,
+        num_waiting: int,
+        num_residuals: int,
+        min_samples: int,
+    ) -> int:
+        warm = num_residuals >= min_samples
+
+        if kv_usage > 0.95 and num_waiting > 0:
+            return 256 if warm else 512
+        if kv_usage > 0.85:
+            return 128 if warm else 256
+        if kv_usage > 0.70:
+            return 64 if warm else 128
+        return 16 if warm else 32
+
+    @staticmethod
+    def _decode_tail_quantile_for_congestion(
+        kv_usage: float,
+        num_waiting: int,
+        num_residuals: int,
+        min_samples: int,
+    ) -> float:
+        warm = num_residuals >= min_samples
+
+        if kv_usage > 0.95 and num_waiting > 0:
+            return 0.97 if warm else 0.95
+        if kv_usage > 0.85:
+            return 0.94 if warm else 0.92
+        return 0.90 if warm else 0.88
+
+    def _compute_adaptive_decode_reserve(
+        self,
+        *,
+        predicted_target: int,
+        num_output_processed_tokens: int,
+        snapshot_base_reserve_tokens: float,
+    ) -> int:
+        base_reserve = max(0.0, float(snapshot_base_reserve_tokens))
+        overshoot = max(
+            0.0, float(num_output_processed_tokens) - float(predicted_target)
+        )
+        reserve = max(
+            base_reserve,
+            float(self._decode_tail_alpha) * overshoot,
+        )
+        return max(1, int(math.ceil(reserve)))
+
+    def _snapshot_decode_reserve_base_tokens(
+        self,
+        *,
+        kv_usage: float,
+        num_waiting: int,
+    ) -> float:
+        num_residuals = len(self._decode_tail_residual_samples)
+        min_samples = self._decode_tail_min_samples
+        floor_tokens = float(
+            self._decode_floor_tokens(
+                kv_usage=kv_usage,
+                num_waiting=num_waiting,
+                num_residuals=num_residuals,
+                min_samples=min_samples,
+            )
+        )
+        tail_quantile = self._decode_tail_quantile_for_congestion(
+            kv_usage=kv_usage,
+            num_waiting=num_waiting,
+            num_residuals=num_residuals,
+            min_samples=min_samples,
+        )
+        tail_tokens = self._decode_residual_quantile(tail_quantile)
+        return max(0.0, floor_tokens, tail_tokens)
 
     def _build_state_snapshot(self) -> SchedulerStateSnapshot:
         self._snapshot_version += 1
         created_at = time.monotonic()
         requests: dict[str, RequestStateSnapshot] = {}
         long_threshold = self.scheduler_config.long_prefill_token_threshold
-        
+
+        if self.scheduler_config.policy == "priority":
+            # Will need to manage a heapq for waiting queue
+            raise NotImplementedError("Priority scheduling not implemented yet")
+        if self.scheduler_config.policy != "fcfs":
+            raise NotImplementedError(
+                f"Unsupported scheduling policy: {self.scheduler_config.policy}"
+            )
+
+        running_request_ids = [req.request_id for req in self.running]
+        waiting_request_ids = [req.request_id for req in self.waiting]
+        running_id_set = set(running_request_ids)
+        waiting_id_set = set(waiting_request_ids)
+        kv_usage = float(self.kv_cache_manager.usage)
+        num_waiting = len(self.waiting)
+        snapshot_base_reserve_tokens = self._snapshot_decode_reserve_base_tokens(
+            kv_usage=kv_usage,
+            num_waiting=num_waiting,
+        )
+
+        prefill_backlog_running = 0
+        prefill_backlog_waiting = 0
+        decode_backlog_total = 0
+        running_context_length_sum_snapshot = 0
+
         max_arrival_time = -1
         for request_id, request in self.requests.items():
             kv_blocks = self.kv_cache_manager.get_blocks(request_id)
             kv_block_counts = tuple(len(block_group) for block_group in kv_blocks.blocks)
-            
+
             num_prompt_tokens = request.num_prompt_tokens
             num_computed_tokens = request.num_computed_tokens
             num_prompt_processed_tokens = min(num_computed_tokens, num_prompt_tokens)
             num_output_processed_tokens = request.num_output_tokens
-            
+
             # might need to artificially ensure that num_computed_tokens and num_tokens
             # match expectations (we calculate num_tokens as num_prompt_tokens + decode_processed)
-            
-            num_output_target_tokens = max(num_output_processed_tokens, request.max_tokens // 2) + 1
-            num_output_target_tokens = min(num_output_target_tokens, request.max_tokens, self.max_model_len - num_prompt_tokens)
-            # num_output_target_tokens = min(request.max_tokens, self.max_model_len - num_prompt_tokens)
-            # num_output_target_tokens = 8192
-            
+
+            predicted_target = None
+            if request.output_length_prediction is not None:
+                predicted_target = int(
+                    math.ceil(request.output_length_prediction.mean_tokens)
+                )
+            reserve_anchor = (
+                predicted_target
+                if predicted_target is not None and predicted_target > 0
+                else num_output_processed_tokens
+            )
+            adaptive_reserve = self._compute_adaptive_decode_reserve(
+                predicted_target=int(reserve_anchor),
+                num_output_processed_tokens=int(num_output_processed_tokens),
+                snapshot_base_reserve_tokens=float(snapshot_base_reserve_tokens),
+            )
+            if predicted_target is not None and predicted_target > 0:
+                num_output_target_tokens = predicted_target
+            else:
+                num_output_target_tokens = (
+                    max(num_output_processed_tokens, request.max_tokens // 2) + 1
+                )
+            num_output_target_tokens = max(
+                num_output_target_tokens,
+                num_output_processed_tokens + adaptive_reserve,
+            )
+            decode_budget = max(self.max_model_len - num_prompt_tokens, 1)
+            num_output_target_tokens = min(
+                num_output_target_tokens,
+                max(request.max_tokens, num_output_processed_tokens + 1),
+                decode_budget,
+            )
+
             assert num_output_target_tokens > num_output_processed_tokens, "target number of tokens must be greater than processed number of tokens"
             assert num_output_target_tokens > 0, "target number of tokens must be positive"
             assert request.num_tokens == num_prompt_tokens + num_output_processed_tokens, "total number of tokens so far mismatch"
-            
+
+            prefill_remaining = max(num_prompt_tokens - num_prompt_processed_tokens, 0)
+            decode_remaining = max(num_output_target_tokens - num_output_processed_tokens, 0)
+            if request_id in running_id_set:
+                prefill_backlog_running += prefill_remaining
+                decode_backlog_total += decode_remaining
+                running_context_length_sum_snapshot += (
+                    num_prompt_tokens + num_output_processed_tokens
+                )
+            elif request_id in waiting_id_set:
+                prefill_backlog_waiting += prefill_remaining
+                decode_backlog_total += decode_remaining
+
             requests[request_id] = RequestStateSnapshot(
                 request_id=request_id,
                 status=request.status.name,
@@ -1331,7 +1551,7 @@ class Scheduler(SchedulerInterface):
             )
             max_arrival_time = max(max_arrival_time, request.arrival_time)
 
-        num_prompt_tokens = 1024
+        num_prompt_tokens = 8192
         dummy_request_id = "__DUMMY__"
         requests[dummy_request_id] = RequestStateSnapshot(
             request_id=dummy_request_id,
@@ -1349,47 +1569,24 @@ class Scheduler(SchedulerInterface):
             is_long_prompt=long_threshold > 0 and num_prompt_tokens >= long_threshold,
             kv_block_counts=tuple(0 for _ in self.kv_cache_config.kv_cache_groups)
         )
-        
-        running_request_ids: list[str] = []
-        waiting_request_ids: list[str] = []
-        
-        if self.scheduler_config.policy == "priority":
-            # Will need to manage a heapq for waiting queue
-            raise NotImplementedError("Priority scheduling not implemented yet")
-        elif self.scheduler_config.policy == "fcfs":
-            running_request_ids = [req.request_id for req in self.running]
-            waiting_request_ids = [req.request_id for req in self.waiting] + [dummy_request_id]
-        
-        # logger.info("Scheduler Snapshot - Running Requests:", running_request_ids)
-        # logger.info("Scheduler Snapshot - Waiting Requests:", waiting_request_ids)
-        
+
+        waiting_request_ids = waiting_request_ids + [dummy_request_id]
+        prefill_backlog_total = prefill_backlog_running + prefill_backlog_waiting
+
         block_pool = self.kv_cache_manager.block_pool
         kv_cache_config_snapshot = SchedulerKVCacheSnapshot(
             num_gpu_blocks=self.cache_config.num_gpu_blocks,
-            block_size=self.kv_cache_manager.block_size,
+            # Prefix caching can be disabled, in which case KVCacheManager keeps
+            # block_size unset. Snapshots must still provide an integer.
+            block_size=self.block_size,
             kv_cache_groups=self.kv_cache_config.kv_cache_groups,
             kv_cache_usage=self.kv_cache_manager.usage,
             kv_cache_total_blocks=block_pool.num_gpu_blocks,
             kv_cache_free_blocks=block_pool.get_num_free_blocks(),
         )
-        
-        parallel_config_snapshot = SchedulerParallelSnapshot(
-            decode_context_parallel_size=self.dcp_world_size
-        )
+        parallel_config_snapshot = replace(self._parallel_snapshot_template)
+        scheduler_config_snapshot = replace(self._config_snapshot_template)
 
-        scheduler_config_snapshot = SchedulerConfigSnapshot(
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
-            max_num_seqs=self.scheduler_config.max_num_seqs,
-            max_model_len=self.scheduler_config.max_model_len,
-            # max_num_partial_prefills=self.scheduler_config.max_num_partial_prefills,
-            # max_long_partial_prefills=self.scheduler_config.max_long_partial_prefills,
-            long_prefill_token_threshold=long_threshold,
-            chunked_prefill_enabled=self.scheduler_config.chunked_prefill_enabled,
-            # num_lookahead_slots=self.scheduler_config.num_lookahead_slots,
-            # num_lookahead_tokens=self.num_lookahead_tokens,
-            policy=self.scheduler_config.policy,
-        )
-        
         return SchedulerStateSnapshot(
             version=self._snapshot_version,
             created_at=created_at,
@@ -1401,6 +1598,13 @@ class Scheduler(SchedulerInterface):
             config=scheduler_config_snapshot,
             kv_cache_config=kv_cache_config_snapshot,
             parallel_config=parallel_config_snapshot,
+            resident_set_size=len(running_id_set),
+            waiting_set_size=len(waiting_id_set),
+            prefill_backlog_running_tokens=int(prefill_backlog_running),
+            prefill_backlog_waiting_tokens=int(prefill_backlog_waiting),
+            prefill_backlog_total_tokens=int(prefill_backlog_total),
+            decode_backlog_total_tokens=int(decode_backlog_total),
+            running_context_length_sum_snapshot=int(running_context_length_sum_snapshot),
         )
 
     def add_request(self, request: Request) -> None:
@@ -1458,6 +1662,7 @@ class Scheduler(SchedulerInterface):
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
+        self._record_decode_tail_residual(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:

@@ -1028,6 +1028,25 @@ class AsyncBatchFileStatLogger(StatLoggerBase):
     """Asynchronously write per-batch stats to a file without blocking sched."""
 
     _FLUSH_BATCH = 64
+    _HEADER_COLUMNS = (
+        "ts",
+        "engine",
+        "prefill",
+        "prefill_sq_sum",
+        "decode",
+        "decode_sq_sum",
+        "total",
+        "sched",
+        "exec",
+        "interval",
+        "num_seqs",
+        "sum_tokens",
+        "sum_sq_tokens",
+        "avg_tokens",
+        "max_tokens",
+    )
+    _HEADER_LINE = ",".join(_HEADER_COLUMNS) + "\n"
+    _HEADER_LOCK = threading.Lock()
 
     def __init__(self, vllm_config: VllmConfig, engine_index: int = 0):
         self.engine_index = engine_index
@@ -1044,6 +1063,7 @@ class AsyncBatchFileStatLogger(StatLoggerBase):
         self._buffer: list[str] = []
         self._last_flush = time.monotonic()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._ensure_header_file()
         # Open file in append mode; line buffering keeps writes cheap.
         self._fh = open(self.file_path, "a", buffering=1, encoding="utf-8")
         self._thread.start()
@@ -1080,6 +1100,21 @@ class AsyncBatchFileStatLogger(StatLoggerBase):
             except queue.Full:
                 # Drop if still full.
                 pass
+
+    def _ensure_header_file(self) -> None:
+        with self._HEADER_LOCK:
+            needs_header = True
+            try:
+                if os.path.exists(self.file_path) and os.path.getsize(
+                    self.file_path
+                ) > 0:
+                    needs_header = False
+            except OSError:
+                pass
+            if not needs_header:
+                return
+            with open(self.file_path, "a", encoding="utf-8") as header_fh:
+                header_fh.write(self._HEADER_LINE)
 
     def record(
         self,

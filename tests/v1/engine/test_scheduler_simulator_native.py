@@ -194,6 +194,80 @@ def _build_multi_request_snapshot() -> SchedulerStateSnapshot:
     )
 
 
+def _build_prompt_override_snapshot() -> SchedulerStateSnapshot:
+    running_req = RequestStateSnapshot(
+        request_id="run-req",
+        status="RUNNING",
+        priority=0,
+        arrival_time=1.0,
+        num_prompt_tokens=64,
+        num_computed_tokens=64,
+        num_output_target_tokens=68,
+        num_prompt_processed_tokens=64,
+        num_output_processed_tokens=0,
+        max_tokens=64,
+        num_preemptions=0,
+        num_cached_tokens=64,
+        is_long_prompt=False,
+        kv_block_counts=(6,),
+    )
+    dummy_req = RequestStateSnapshot(
+        request_id="__DUMMY__",
+        status="WAITING",
+        priority=0,
+        arrival_time=10.0,
+        num_prompt_tokens=16,
+        num_computed_tokens=0,
+        num_output_target_tokens=16,
+        num_prompt_processed_tokens=0,
+        num_output_processed_tokens=0,
+        max_tokens=64,
+        num_preemptions=0,
+        num_cached_tokens=0,
+        is_long_prompt=False,
+        kv_block_counts=(0,),
+    )
+    config_snapshot = SchedulerConfigSnapshot(
+        max_num_batched_tokens=128,
+        max_num_seqs=2,
+        max_model_len=2048,
+        long_prefill_token_threshold=256,
+        chunked_prefill_enabled=True,
+        policy="fcfs",
+    )
+    kv_cache_snapshot = SchedulerKVCacheSnapshot(
+        num_gpu_blocks=8,
+        block_size=16,
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["layer0"],
+                kv_cache_spec=KVCacheSpec(block_size=16),
+            )
+        ],
+        kv_cache_usage=0.75,
+        kv_cache_total_blocks=8,
+        kv_cache_free_blocks=2,
+    )
+    parallel_snapshot = SchedulerParallelSnapshot(
+        decode_context_parallel_size=1
+    )
+    return SchedulerStateSnapshot(
+        version=4,
+        created_at=9.0,
+        num_running=1,
+        num_waiting=1,
+        running_request_ids=["run-req"],
+        waiting_request_ids=["__DUMMY__"],
+        requests={
+            "run-req": running_req,
+            "__DUMMY__": dummy_req,
+        },
+        config=config_snapshot,
+        kv_cache_config=kv_cache_snapshot,
+        parallel_config=parallel_snapshot,
+    )
+
+
 def _build_heavy_snapshot(num_running: int = 16,
                           num_waiting: int = 512) -> SchedulerStateSnapshot:
     """Creates a deterministic workload large enough for timing."""
@@ -313,6 +387,7 @@ def test_native_worker_receives_python_snapshot():
         intercept=1.0,
         prefill_coeff=0.1,
         decode_coeff=0.2,
+        sum_coeff=0.0,
     )
     worker.update_snapshot(encoded)
 
@@ -334,6 +409,7 @@ def test_native_wrapper_round_trip_snapshot():
         intercept=1.0,
         prefill_coeff=0.1,
         decode_coeff=0.2,
+        sum_coeff=0.0,
     )
     worker.update_snapshot(snapshot)
 
@@ -350,6 +426,7 @@ def test_native_run_simulation_matches_python():
         intercept=1.0,
         prefill_coeff=0.1,
         decode_coeff=0.2,
+        sum_coeff=0.0,
     )
     py_result = py_worker._run_simulation(snapshot)
 
@@ -358,6 +435,7 @@ def test_native_run_simulation_matches_python():
         intercept=1.0,
         prefill_coeff=0.1,
         decode_coeff=0.2,
+        sum_coeff=0.0,
     )
     native_metadata = native_worker.run_simulation_for_test(encoded)
     
@@ -373,6 +451,7 @@ def test_native_simulation_multiple_real_batches():
         intercept=1.0,
         prefill_coeff=0.1,
         decode_coeff=0.2,
+        sum_coeff=0.0,
     )
     py_result = py_worker._run_simulation(snapshot)
 
@@ -381,6 +460,7 @@ def test_native_simulation_multiple_real_batches():
         intercept=1.0,
         prefill_coeff=0.1,
         decode_coeff=0.2,
+        sum_coeff=0.0,
     )
     native_metadata = native_worker.run_simulation_for_test(encoded)
         
@@ -391,6 +471,50 @@ def test_native_simulation_multiple_real_batches():
     assert native_metadata["num_running"] <= 1
 
 
+def test_native_prompt_override_changes_critical_path_result():
+    snapshot = _build_prompt_override_snapshot()
+    encoded = encode_scheduler_state_snapshot(snapshot)
+    worker = _scheduler_sim_native.SchedulerSimulationWorker(
+        interval_s=0.01,
+        intercept=1.0,
+        prefill_coeff=0.1,
+        decode_coeff=0.2,
+        sum_coeff=0.0,
+    )
+    worker.update_snapshot(encoded)
+
+    no_override = worker.run_simulation_on_latest_snapshot(16)
+    large_override = worker.run_simulation_on_latest_snapshot(160)
+    assert no_override is not None
+    assert large_override is not None
+
+    no_override_metadata = no_override[6]
+    large_override_metadata = large_override[6]
+    assert (
+        float(large_override_metadata["estimated_wait_ms"])
+        > float(no_override_metadata["estimated_wait_ms"])
+    )
+
+
+def test_native_prompt_override_does_not_mutate_cached_snapshot_state():
+    snapshot = _build_prompt_override_snapshot()
+    encoded = encode_scheduler_state_snapshot(snapshot)
+    worker = _scheduler_sim_native.SchedulerSimulationWorker(
+        interval_s=0.01,
+        intercept=1.0,
+        prefill_coeff=0.1,
+        decode_coeff=0.2,
+        sum_coeff=0.0,
+    )
+    worker.update_snapshot(encoded)
+
+    baseline = worker.run_simulation_for_test(encoded)
+    worker.run_simulation_on_latest_snapshot(256)
+    after_override = worker.run_simulation_for_test(encoded)
+
+    assert after_override == baseline
+
+
 def test_python_worker_invokes_native_simulator():
     snapshot = _build_snapshot()
     py_worker = PythonSchedulerSimulationWorker(
@@ -398,6 +522,7 @@ def test_python_worker_invokes_native_simulator():
         intercept=1.0,
         prefill_coeff=0.1,
         decode_coeff=0.2,
+        sum_coeff=0.0,
     )
     if SchedulerSimulationWorker is not NativeSchedulerSimulationWorker:
         pytest.skip("Native scheduler simulator unavailable")
@@ -406,6 +531,7 @@ def test_python_worker_invokes_native_simulator():
         intercept=1.0,
         prefill_coeff=0.1,
         decode_coeff=0.2,
+        sum_coeff=0.0,
     )
     metadata = native_worker.run_simulation(snapshot)
     encoded = encode_scheduler_state_snapshot(snapshot)
@@ -414,6 +540,7 @@ def test_python_worker_invokes_native_simulator():
         intercept=1.0,
         prefill_coeff=0.1,
         decode_coeff=0.2,
+        sum_coeff=0.0,
     )
     native_metadata = backend_worker.run_simulation_for_test(encoded)
     assert metadata == native_metadata
@@ -440,6 +567,7 @@ def test_native_scheduler_simulator_timing():
         intercept=1.0,
         prefill_coeff=0.1,
         decode_coeff=0.2,
+        sum_coeff=0.0,
     )
 
     for _ in range(_TIMING_WARMUP):

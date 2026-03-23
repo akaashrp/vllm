@@ -156,6 +156,7 @@ class EngineCore:
             interval = (
                 vllm_config.scheduler_config.wait_time_simulation_interval_ms / 1000.0
             )
+            snapshot_interval = interval / 2
             self.scheduler_simulator = SchedulerSimulationWorker(
                 interval_s=interval,
                 # average_prompt_length=self.vllm_config.scheduler_config.average_prompt_length,
@@ -164,9 +165,10 @@ class EngineCore:
                 intercept=self.vllm_config.scheduler_config.simulation_intercept,
                 prefill_coeff=self.vllm_config.scheduler_config.simulation_prefill_coeff,
                 decode_coeff=self.vllm_config.scheduler_config.simulation_decode_coeff,
+                sum_coeff=self.vllm_config.scheduler_config.simulation_sum_coeff,
             )
             self.scheduler.set_snapshot_consumer(
-                self.scheduler_simulator.update_snapshot
+                self.scheduler_simulator.update_snapshot, interval_s=snapshot_interval
             )
             self.scheduler_simulator.start()
         else:
@@ -512,12 +514,48 @@ class EngineCore:
     def execute_dummy_batch(self):
         self.model_executor.execute_dummy_batch()
 
-    def get_wait_time_report(self, include_timings: bool = False) -> dict:
+
+    def get_wait_time_report(
+        self,
+        include_timings: bool = False,
+        prompt_tokens: Optional[int] = None,
+    ) -> dict:
         if self.scheduler_simulator is None:
             return {"enabled": False}
-        result = self.scheduler_simulator.latest_result()
+
+        simulation_mode = "cached"
+        result = None
+        if prompt_tokens is not None:
+            run_critical_path = getattr(
+                self.scheduler_simulator, "run_simulation_on_latest_snapshot", None
+            )
+            if callable(run_critical_path):
+                try:
+                    result = run_critical_path(int(prompt_tokens))
+                except Exception:
+                    logger.exception(
+                        "Prompt-aware wait-time simulation failed; falling back "
+                        "to cached result"
+                    )
+                else:
+                    if result is not None:
+                        simulation_mode = "critical_path_prompt_override"
+
+        if result is None:
+            result = self.scheduler_simulator.latest_result()
+            simulation_mode = "cached"
+
         if result is None:
             return {"enabled": True, "ready": False}
+        metadata: dict[str, Any] = dict(result.metadata or {})
+        latest_snapshot_summary_fn = getattr(
+            self.scheduler_simulator, "latest_snapshot_summary", None
+        )
+        if callable(latest_snapshot_summary_fn):
+            snapshot_summary = latest_snapshot_summary_fn()
+            if isinstance(snapshot_summary, dict) and snapshot_summary:
+                metadata.update(snapshot_summary)
+        metadata["simulation_mode"] = simulation_mode
         payload = {
             "enabled": True,
             "ready": True,
@@ -525,7 +563,7 @@ class EngineCore:
             "snapshot_timestamp": result.snapshot_timestamp,
             "simulation_timestamp": result.simulation_timestamp,
             "num_requests": result.num_requests,
-            "metadata": result.metadata,
+            "metadata": metadata,
         }
         if include_timings:
             payload["snapshot_build_latency_ms"] = result.snapshot_build_latency_ms

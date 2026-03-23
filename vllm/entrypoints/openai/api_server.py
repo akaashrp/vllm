@@ -403,7 +403,9 @@ async def ping(raw_request: Request) -> Response:
 
 @router.get("/wait_time")
 async def wait_time_report(
-    raw_request: Request, include_timings: bool = Query(False)
+    raw_request: Request,
+    include_timings: bool = Query(False),
+    prompt_tokens: Optional[int] = Query(default=None, ge=0),
 ):
     """Expose the latest wait-time simulation report."""
 
@@ -415,7 +417,10 @@ async def wait_time_report(
             detail="Wait time simulation is not supported by this engine",
         )
     try:
-        reports = await method(include_timings)
+        reports = await method(
+            include_timings=include_timings,
+            prompt_tokens=prompt_tokens,
+        )
     except NotImplementedError as exc:  # pragma: no cover
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST,

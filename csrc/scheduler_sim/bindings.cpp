@@ -436,7 +436,9 @@ class SimRequestState {
 
 class SimulationContext {
  public:
-  explicit SimulationContext(const SchedulerStateSnapshotNative& snapshot)
+  explicit SimulationContext(
+      const SchedulerStateSnapshotNative& snapshot,
+      std::optional<int64_t> dummy_prompt_tokens_override = std::nullopt)
       : snapshot_(snapshot),
         kv_free_blocks_(snapshot.kv_cache_config.kv_cache_free_blocks),
         current_time_ms_(0.0),
@@ -445,7 +447,12 @@ class SimulationContext {
         num_batches_(0) {
     requests_.reserve(snapshot.requests.size());
     for (const auto& entry : snapshot.requests) {
-      requests_.emplace(entry.first, SimRequestState(entry.second));
+      RequestStateSnapshotNative request_snapshot = entry.second;
+      if (entry.first == "__DUMMY__" && dummy_prompt_tokens_override.has_value()) {
+        request_snapshot.num_prompt_tokens =
+            std::max<int64_t>(0, *dummy_prompt_tokens_override);
+      }
+      requests_.emplace(entry.first, SimRequestState(request_snapshot));
       kv_allocations_[entry.first] =
           entry.second.kv_block_counts.empty()
               ? std::vector<int64_t>(num_kv_groups(), 0)
@@ -700,6 +707,7 @@ void RemoveAll(Container& container,
 struct BatchBuildOutput {
   std::vector<SimRequestState*> batch_requests;
   std::vector<int64_t> batch_tokens;
+  int64_t sum_context_length = 0;
 };
 
 static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
@@ -781,7 +789,6 @@ static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
       preempted_req->set_status("PREEMPTED");
       preempted_req->set_num_computed_tokens(0);
       preempted_req->set_prefill_processed(0);
-      preempted_req->set_decode_processed(0);
       preempted_req->increment_preemptions();
 
       if (config.policy == "priority") {
@@ -809,6 +816,7 @@ static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
 
     batch_requests.push_back(request);
     batch_tokens.push_back(num_new_tokens);
+    output.sum_context_length += request->num_tokens();
   }
 
   std::deque<SimRequestState*> skipped_waiting_requests;
@@ -909,6 +917,7 @@ static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
 
       batch_requests.push_back(request);
       batch_tokens.push_back(num_new_tokens);
+      output.sum_context_length += request->num_tokens();
     }
   }
 
@@ -1022,22 +1031,26 @@ static ApplyBatchOutput ApplyBatchResultNative(
 
 static double EstimateBatchTime(int64_t num_prefill_tokens,
                                 int64_t num_decode_tokens,
+                                int64_t sum_context_length,
                                 double intercept,
                                 double prefill_coeff,
-                                double decode_coeff) {
+                                double decode_coeff,
+                                double sum_coeff) {
   if (num_prefill_tokens <= 0 && num_decode_tokens <= 0) {
     throw std::runtime_error("Batch must have at least one token");
   }
-  return intercept + (prefill_coeff * num_prefill_tokens) +
-         (decode_coeff * num_decode_tokens);
+  return (intercept + (prefill_coeff * num_prefill_tokens) +
+         (decode_coeff * num_decode_tokens) + (sum_coeff * sum_context_length)) * 1000;
 }
 
 static SimulationMetadataNative RunSimulationNative(
     const SchedulerStateSnapshotNative& snapshot,
     double intercept,
     double prefill_coeff,
-    double decode_coeff) {
-  SimulationContext state(snapshot);
+    double decode_coeff,
+    double sum_coeff,
+    std::optional<int64_t> dummy_prompt_tokens_override = std::nullopt) {
+  SimulationContext state(snapshot, dummy_prompt_tokens_override);
   int idle_ticks = 0;
   const int max_idle_ticks = 4;
 
@@ -1068,8 +1081,8 @@ static SimulationMetadataNative RunSimulationNative(
     auto apply_result =
         ApplyBatchResultNative(state, batch.batch_requests, batch.batch_tokens);
     double batch_time = EstimateBatchTime(
-        apply_result.total_prefill, apply_result.total_decode, intercept,
-        prefill_coeff, decode_coeff);
+        apply_result.total_prefill, apply_result.total_decode, batch.sum_context_length, intercept,
+        prefill_coeff, decode_coeff, sum_coeff);
     double end_time = start_time + batch_time;
 
     for (SimRequestState* req : apply_result.finished) {
@@ -1425,11 +1438,13 @@ class SchedulerSimulationWorkerStub {
   SchedulerSimulationWorkerStub(double interval_s,
                                 double intercept,
                                 double prefill_coeff,
-                                double decode_coeff)
+                                double decode_coeff,
+                                double sum_coeff)
       : interval_s_(interval_s),
         intercept_(intercept),
         prefill_coeff_(prefill_coeff),
-        decode_coeff_(decode_coeff) {}
+        decode_coeff_(decode_coeff),
+        sum_coeff_(sum_coeff) {}
 
   ~SchedulerSimulationWorkerStub() { StopThread(); }
 
@@ -1452,10 +1467,9 @@ class SchedulerSimulationWorkerStub {
         static_cast<int64_t>(parsed_snapshot->requests.size());
     info.build_latency_ms = parsed_snapshot->build_latency_ms;
 
-    parsed_snapshot_ = parsed_snapshot;
-
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      parsed_snapshot_ = parsed_snapshot;
       pending_snapshot_ = parsed_snapshot;
       pending_info_ = info;
     }
@@ -1484,7 +1498,7 @@ class SchedulerSimulationWorkerStub {
     auto snapshot = ParseSchedulerSnapshot(parser.parse());
     try {
       auto metadata = RunSimulationNative(snapshot, intercept_,
-                                          prefill_coeff_, decode_coeff_);
+                                          prefill_coeff_, decode_coeff_, sum_coeff_);
       return MetadataToPyDict(metadata);
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string("Scheduler simulation failed: ") +
@@ -1493,6 +1507,48 @@ class SchedulerSimulationWorkerStub {
       throw std::runtime_error(
           "Scheduler simulation failed with an unknown error");
     }
+  }
+
+  py::object run_simulation_on_latest_snapshot(int64_t prompt_tokens) const {
+    if (prompt_tokens < 0) {
+      throw std::runtime_error("prompt_tokens must be >= 0");
+    }
+
+    std::shared_ptr<const SchedulerStateSnapshotNative> snapshot;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot = parsed_snapshot_;
+    }
+    if (!snapshot) {
+      return py::none();
+    }
+
+    auto run_start = std::chrono::steady_clock::now();
+    double simulation_timestamp =
+        std::chrono::duration<double>(run_start.time_since_epoch()).count();
+
+    SimulationMetadataNative metadata;
+    try {
+      metadata =
+          RunSimulationNative(*snapshot, intercept_, prefill_coeff_,
+                              decode_coeff_, sum_coeff_, prompt_tokens);
+    } catch (const std::exception& e) {
+      throw std::runtime_error(std::string("Scheduler simulation failed: ") +
+                               e.what());
+    } catch (...) {
+      throw std::runtime_error(
+          "Scheduler simulation failed with an unknown error");
+    }
+
+    auto run_end = std::chrono::steady_clock::now();
+    double sim_latency_ms =
+        std::chrono::duration<double, std::milli>(run_end - run_start).count();
+
+    py::dict metadata_dict = MetadataToPyDict(metadata);
+    return py::make_tuple(
+        snapshot->version, snapshot->created_at, simulation_timestamp,
+        static_cast<int64_t>(snapshot->requests.size()),
+        snapshot->build_latency_ms, sim_latency_ms, metadata_dict);
   }
 
   void clear_latest_snapshot() {
@@ -1582,7 +1638,7 @@ class SchedulerSimulationWorkerStub {
       bool simulation_ok = true;
       try {
         metadata = RunSimulationNative(*snapshot, intercept_,
-                                       prefill_coeff_, decode_coeff_);
+                                       prefill_coeff_, decode_coeff_, sum_coeff_);
       } catch (const std::exception& e) {
         simulation_ok = false;
         std::fprintf(stderr,
@@ -1624,6 +1680,7 @@ class SchedulerSimulationWorkerStub {
   double intercept_;
   double prefill_coeff_;
   double decode_coeff_;
+  double sum_coeff_;
   bool has_snapshot_ = false;
   std::string latest_snapshot_bytes_;
   std::shared_ptr<const SchedulerStateSnapshotNative> parsed_snapshot_;
@@ -1642,11 +1699,12 @@ class SchedulerSimulationWorkerStub {
 PYBIND11_MODULE(_scheduler_sim, m) {
   py::class_<vllm::scheduler_sim::SchedulerSimulationWorkerStub>(
       m, "SchedulerSimulationWorker")
-      .def(py::init<double, double, double, double>(),
+      .def(py::init<double, double, double, double, double>(),
            py::arg("interval_s"),
            py::arg("intercept"),
            py::arg("prefill_coeff"),
-           py::arg("decode_coeff"))
+           py::arg("decode_coeff"),
+           py::arg("sum_coeff"))
       .def("start", &vllm::scheduler_sim::SchedulerSimulationWorkerStub::start)
       .def("stop", &vllm::scheduler_sim::SchedulerSimulationWorkerStub::stop)
       .def("update_snapshot",
@@ -1662,6 +1720,10 @@ PYBIND11_MODULE(_scheduler_sim, m) {
            &vllm::scheduler_sim::SchedulerSimulationWorkerStub::
                run_simulation_for_test,
            py::arg("snapshot_bytes"))
+      .def("run_simulation_on_latest_snapshot",
+           &vllm::scheduler_sim::SchedulerSimulationWorkerStub::
+               run_simulation_on_latest_snapshot,
+           py::arg("prompt_tokens"))
       .def("latest_result_summary",
            &vllm::scheduler_sim::SchedulerSimulationWorkerStub::
                latest_result_summary)

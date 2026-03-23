@@ -34,6 +34,10 @@ from vllm.utils import Device, as_list, cancel_task_threadsafe, cdiv, deprecate_
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+from vllm.v1.engine.output_length_predictor import (
+    AdmissionFeatures,
+    OutputLengthPredictor,
+)
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.engine.processor import Processor
@@ -106,6 +110,25 @@ class AsyncLLM(EngineClient):
 
         # Processor (converts Inputs --> EngineCoreRequests).
         self.processor = Processor(vllm_config, mm_registry=mm_registry)
+        self.output_length_predictor: Optional[OutputLengthPredictor] = None
+        sched_cfg = vllm_config.scheduler_config
+        if (
+            sched_cfg.enable_wait_time_simulation
+            and sched_cfg.output_length_model_path
+        ):
+            try:
+                self.output_length_predictor = OutputLengthPredictor(
+                    sched_cfg.output_length_model_path,
+                    preferred_quantile=sched_cfg.output_length_tail_quantile,
+                )
+                logger.info(
+                    "Loaded output-length predictor from %s",
+                    sched_cfg.output_length_model_path,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to initialize output-length predictor: %s", exc
+                )
 
         # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).
         self.output_processor = OutputProcessor(
@@ -297,6 +320,9 @@ class AsyncLLM(EngineClient):
             )
             prompt_text = prompt if isinstance(prompt, str) else prompt.get("prompt")
 
+        if not is_pooling:
+            self._attach_output_length_prediction(request, prompt_text)
+
         if is_pooling or params.n == 1:
             await self._add_request(request, prompt_text, None, 0, queue)
             return queue
@@ -317,6 +343,31 @@ class AsyncLLM(EngineClient):
                 child_request, prompt_text, parent_request, idx, queue
             )
         return queue
+
+    def _attach_output_length_prediction(
+        self, request: EngineCoreRequest, prompt_text: Optional[str]
+    ) -> None:
+        if (
+            self.output_length_predictor is None
+            or not prompt_text
+            or not request.prompt_token_ids
+        ):
+            return
+        prompt_tokens = len(request.prompt_token_ids)
+        if prompt_tokens <= 0:
+            return
+        admission = AdmissionFeatures(
+            model_id=self.model_config.model,
+            prompt_text=prompt_text,
+            prompt_token_count=prompt_tokens,
+        )
+        prediction = self.output_length_predictor.predict(admission)
+        if prediction is None:
+            return
+        request.predicted_output_tokens_p50 = prediction.median_tokens
+        request.predicted_output_tokens_tail = prediction.tail_tokens
+        request.predicted_output_tokens_quantile = prediction.quantile
+        request.predicted_output_tokens_mean = prediction.mean_tokens
 
     async def _add_request(
         self,
@@ -763,13 +814,18 @@ class AsyncLLM(EngineClient):
                 custom_stat_loggers=None,
             )
 
-    async def get_wait_time_report(self, include_timings: bool = False):
+    async def get_wait_time_report(
+        self,
+        include_timings: bool = False,
+        prompt_tokens: Optional[int] = None,
+    ):
         if not hasattr(self.engine_core, "collective_rpc_async"):
             raise NotImplementedError(
                 "Wait time simulation is not available for this engine"
             )
         return await self.engine_core.collective_rpc_async(
-            "get_wait_time_report", args=(include_timings,)
+            "get_wait_time_report",
+            args=(include_timings, prompt_tokens),
         )
 
     @property

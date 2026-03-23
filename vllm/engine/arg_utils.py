@@ -450,6 +450,16 @@ class EngineArgs:
 
     enable_chunked_prefill: Optional[bool] = SchedulerConfig.enable_chunked_prefill
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
+    enable_wait_time_simulation: bool = SchedulerConfig.enable_wait_time_simulation
+    wait_time_simulation_interval_ms: int = (
+        SchedulerConfig.wait_time_simulation_interval_ms
+    )
+    simulation_intercept: float = SchedulerConfig.simulation_intercept
+    simulation_prefill_coeff: float = SchedulerConfig.simulation_prefill_coeff
+    simulation_decode_coeff: float = SchedulerConfig.simulation_decode_coeff
+    simulation_sum_coeff: float = SchedulerConfig.simulation_sum_coeff
+    output_length_model_path: Optional[str] = SchedulerConfig.output_length_model_path
+    output_length_tail_quantile: float = SchedulerConfig.output_length_tail_quantile
 
     disable_hybrid_kv_cache_manager: bool = (
         SchedulerConfig.disable_hybrid_kv_cache_manager
@@ -1017,6 +1027,38 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--async-scheduling", **scheduler_kwargs["async_scheduling"]
         )
+        scheduler_group.add_argument(
+            "--enable-wait-time-simulation",
+            **scheduler_kwargs["enable_wait_time_simulation"],
+        )
+        scheduler_group.add_argument(
+            "--wait-time-simulation-interval-ms",
+            **scheduler_kwargs["wait_time_simulation_interval_ms"],
+        )
+        scheduler_group.add_argument(
+            "--simulation-intercept",
+            **scheduler_kwargs["simulation_intercept"],
+        )
+        scheduler_group.add_argument(
+            "--simulation-prefill-coeff",
+            **scheduler_kwargs["simulation_prefill_coeff"],
+        )
+        scheduler_group.add_argument(
+            "--simulation-decode-coeff",
+            **scheduler_kwargs["simulation_decode_coeff"],
+        )
+        scheduler_group.add_argument(
+            "--simulation-sum-coeff",
+            **scheduler_kwargs["simulation_sum_coeff"],
+        )
+        scheduler_group.add_argument(
+            "--output-length-model-path",
+            **scheduler_kwargs["output_length_model_path"],
+        )
+        scheduler_group.add_argument(
+            "--output-length-tail-quantile",
+            **scheduler_kwargs["output_length_tail_quantile"],
+        )
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1499,6 +1541,14 @@ class EngineArgs:
             num_lookahead_slots=num_lookahead_slots,
             enable_chunked_prefill=self.enable_chunked_prefill,
             disable_chunked_mm_input=self.disable_chunked_mm_input,
+            enable_wait_time_simulation=self.enable_wait_time_simulation,
+            wait_time_simulation_interval_ms=self.wait_time_simulation_interval_ms,
+            simulation_intercept=self.simulation_intercept,
+            simulation_prefill_coeff=self.simulation_prefill_coeff,
+            simulation_decode_coeff=self.simulation_decode_coeff,
+            simulation_sum_coeff=self.simulation_sum_coeff,
+            output_length_model_path=self.output_length_model_path,
+            output_length_tail_quantile=self.output_length_tail_quantile,
             is_multimodal_model=model_config.is_multimodal_model,
             is_encoder_decoder=model_config.is_encoder_decoder,
             send_delta_data=(envs.VLLM_USE_RAY_SPMD_WORKER and parallel_config.use_ray),

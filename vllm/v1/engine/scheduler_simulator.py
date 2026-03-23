@@ -132,6 +132,20 @@ class SimulationResult:
     simulation_latency_ms: float = 0.0
 
 
+def _snapshot_backlog_summary(snapshot: SchedulerStateSnapshot) -> dict[str, int]:
+    return {
+        "resident_set_size": int(snapshot.resident_set_size),
+        "waiting_set_size": int(snapshot.waiting_set_size),
+        "prefill_backlog_running_tokens": int(snapshot.prefill_backlog_running_tokens),
+        "prefill_backlog_waiting_tokens": int(snapshot.prefill_backlog_waiting_tokens),
+        "prefill_backlog_total_tokens": int(snapshot.prefill_backlog_total_tokens),
+        "decode_backlog_total_tokens": int(snapshot.decode_backlog_total_tokens),
+        "running_context_length_sum_snapshot": int(
+            snapshot.running_context_length_sum_snapshot
+        ),
+    }
+
+
 @dataclass
 class SimRequestState:
     """Mutable view of an individual request within the simulator."""
@@ -308,17 +322,14 @@ class SimulationContext:
         self.num_batches = 0
 
     def summary_metadata(self) -> dict:
-        # per_request = {}
-        # for req in self.requests.values():
-        #     per_request[req.request_id] = {
-        #         "status": req.status,
-        #         "first_token_ms": req.first_scheduled_time_ms,
-        #         "prefill_done_ms": req.prefill_done_time_ms,
-        #         "finished_ms": req.finished_time_ms,
-        #         "remaining_prefill": req.prefill_remaining,
-        #         "remaining_decode": req.decode_remaining,
-        #         # "kv_blocks": self.kv_allocations.get(req.request_id),
-        #     }
+        # Aggregate backlog/state fields only; keep payload compact by default.
+        non_dummy_running = [req for req in self.running if req.request_id != "__DUMMY__"]
+        non_dummy_waiting = [req for req in self.waiting if req.request_id != "__DUMMY__"]
+        prefill_backlog_running = sum(req.prefill_remaining for req in non_dummy_running)
+        prefill_backlog_waiting = sum(req.prefill_remaining for req in non_dummy_waiting)
+        decode_backlog_total = sum(req.decode_remaining for req in non_dummy_running) + sum(
+            req.decode_remaining for req in non_dummy_waiting
+        )
         return {
             "num_batches": self.num_batches,
             "num_running": len(self.running),
@@ -327,9 +338,14 @@ class SimulationContext:
             "queued_at_snapshot": self.queued_at_snapshot,
             "total_prefill_tokens": self.total_prefill_tokens,
             "total_decode_tokens": self.total_decode_tokens,
-            # "kv_free_blocks": self.kv_free_blocks,
-            # "kv_total_blocks": self.snapshot.kv_cache_config.kv_cache_total_blocks,
-            # "per_request": per_request,
+            "resident_set_size": len(non_dummy_running),
+            "waiting_set_size": len(non_dummy_waiting),
+            "prefill_backlog_running_tokens": int(prefill_backlog_running),
+            "prefill_backlog_waiting_tokens": int(prefill_backlog_waiting),
+            "prefill_backlog_total_tokens": int(
+                prefill_backlog_running + prefill_backlog_waiting
+            ),
+            "decode_backlog_total_tokens": int(decode_backlog_total),
         }
 
     def estimate_wait_time_ms(self, request_id: Optional[str] = None) -> float:
@@ -471,12 +487,15 @@ class PythonSchedulerSimulationWorker:
         intercept: float,
         prefill_coeff: float,
         decode_coeff: float,
+        sum_coeff: float
     ) -> None:
         self._interval_s = max(interval_s, 0.001)
         self._intercept = intercept
         self._prefill_coeff = prefill_coeff
         self._decode_coeff = decode_coeff
+        self._sum_coeff = sum_coeff
         self._latest_snapshot: Optional[SchedulerStateSnapshot] = None
+        self._latest_snapshot_summary: Optional[dict[str, int]] = None
         self._latest_result: Optional[SimulationResult] = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -494,12 +513,30 @@ class PythonSchedulerSimulationWorker:
             self._thread.join(timeout=1.0)
 
     def update_snapshot(self, snapshot: SchedulerStateSnapshot) -> None:
+        snapshot_summary = _snapshot_backlog_summary(snapshot)
         with self._lock:
             self._latest_snapshot = snapshot
+            self._latest_snapshot_summary = snapshot_summary
 
     def latest_result(self) -> Optional[SimulationResult]:
         with self._lock:
             return self._latest_result
+
+    def latest_snapshot_summary(self) -> Optional[dict[str, int]]:
+        with self._lock:
+            if self._latest_snapshot_summary is None:
+                return None
+            return dict(self._latest_snapshot_summary)
+
+
+    def clear_latest_snapshot(self) -> None:
+        with self._lock:
+            self._latest_snapshot = None
+            self._latest_snapshot_summary = None
+
+    def clear_latest_result(self) -> None:
+        with self._lock:
+            self._latest_result = None
 
     def _pop_latest_snapshot(self) -> Optional[SchedulerStateSnapshot]:
         with self._lock:
@@ -544,9 +581,10 @@ class PythonSchedulerSimulationWorker:
     def _build_next_batch(
         self, 
         state: SimulationContext
-    ) -> Tuple[List[SimRequestState], List[int]]:
+    ) -> Tuple[List[SimRequestState], List[int], int]:
         batch_requests: List[SimRequestState] = []
         batch_tokens: List[int] = []
+        sum_context_length: int = 0
         config = state.snapshot.config
         
         max_model_len = config.max_model_len
@@ -611,7 +649,6 @@ class PythonSchedulerSimulationWorker:
                 preempted_req.status = "PREEMPTED"
                 preempted_req.num_computed_tokens = 0
                 preempted_req.prefill_processed = 0
-                preempted_req.decode_processed = 0
                 preempted_req.num_preemptions += 1
                 
                 if config.policy == "priority":
@@ -637,6 +674,7 @@ class PythonSchedulerSimulationWorker:
             
             batch_requests.append(request)
             batch_tokens.append(num_new_tokens)
+            sum_context_length += request.num_tokens
             
         # BODEN: handle differently based on FCFS vs priority
         if config.policy == "priority":
@@ -733,6 +771,7 @@ class PythonSchedulerSimulationWorker:
                     
                 batch_requests.append(request)
                 batch_tokens.append(num_new_tokens)
+                sum_context_length += request.num_tokens
                 
         if skipped_waiting_requests:
             if config.policy == "priority":
@@ -766,7 +805,7 @@ class PythonSchedulerSimulationWorker:
         
         # BODEN: summary metadata is still empty
             
-        return batch_requests, batch_tokens
+        return batch_requests, batch_tokens, sum_context_length
         
     def _apply_batch_result(
         self,
@@ -834,7 +873,6 @@ class PythonSchedulerSimulationWorker:
             if decode_before > 0 and request.is_finished():
                 status_before_stop = request.status
                 
-                # BODEN: need to clear out KV cache after requests finish
                 state.free_request_blocks(request)
 
                 request.status = "FINISHED"
@@ -855,10 +893,16 @@ class PythonSchedulerSimulationWorker:
 
         return total_prefill, total_decode, prefill_done, stopped_running_reqs.union(stopped_preempted_reqs)
 
-    def _estimate_batch_time(self, num_prefill_tokens: int, num_decode_tokens: int, intercept: float, prefill_coeff: float, decode_coeff: float) -> float:
+    def _estimate_batch_time(self, num_prefill_tokens: int, num_decode_tokens: int, sum_context_length: int, intercept: float, 
+                             prefill_coeff: float, decode_coeff: float, sum_coeff: float) -> float:
         """Simple deterministic estimate for per-batch latency in milliseconds."""
         assert num_prefill_tokens > 0 or num_decode_tokens > 0
-        return intercept + (prefill_coeff * num_prefill_tokens) + (decode_coeff * num_decode_tokens)
+        return (
+            intercept
+            + (prefill_coeff * num_prefill_tokens)
+            + (decode_coeff * num_decode_tokens)
+            + (sum_coeff * sum_context_length)
+        ) * 1000.0
 
     def _run_simulation(self, snapshot: SchedulerStateSnapshot) -> SimulationResult:
         simulation_timestamp = time.monotonic()
@@ -867,7 +911,7 @@ class PythonSchedulerSimulationWorker:
         idle_ticks = 0
         max_idle_ticks = 4
         while True:
-            batch_requests, batch_tokens = self._build_next_batch(state)
+            batch_requests, batch_tokens, sum_context_length = self._build_next_batch(state)
             if any(req.request_id == "__DUMMY__" for req in batch_requests):
                 break
             
@@ -888,9 +932,11 @@ class PythonSchedulerSimulationWorker:
             batch_time = self._estimate_batch_time(
                 batch_prefill,
                 batch_decode,
+                sum_context_length,
                 self._intercept,
                 self._prefill_coeff,
                 self._decode_coeff,
+                self._sum_coeff,
             )
             end_time = start_time + batch_time
             
@@ -922,6 +968,7 @@ class NativeSchedulerSimulationWorker:
         intercept: float,
         prefill_coeff: float,
         decode_coeff: float,
+        sum_coeff: float
     ) -> None:
         if _scheduler_sim_native is None:
             raise RuntimeError(
@@ -932,7 +979,9 @@ class NativeSchedulerSimulationWorker:
             intercept=intercept,
             prefill_coeff=prefill_coeff,
             decode_coeff=decode_coeff,
+            sum_coeff=sum_coeff,
         )
+        self._latest_snapshot_summary: Optional[dict[str, int]] = None
         logger.info("Scheduler simulator using native backend")
 
     def start(self) -> None:
@@ -942,11 +991,16 @@ class NativeSchedulerSimulationWorker:
         self._worker.stop()
 
     def update_snapshot(self, snapshot: SchedulerStateSnapshot) -> None:
+        self._latest_snapshot_summary = _snapshot_backlog_summary(snapshot)
         serialized = encode_scheduler_state_snapshot(snapshot)
         self._worker.update_snapshot(serialized)
 
     def latest_result(self) -> Optional[SimulationResult]:
         summary = self._worker.latest_result_summary()
+        return self._result_from_summary(summary)
+
+    @staticmethod
+    def _result_from_summary(summary: Any) -> Optional[SimulationResult]:
         if summary is None:
             return None
         (
@@ -969,6 +1023,23 @@ class NativeSchedulerSimulationWorker:
         result.simulation_latency_ms = simulation_latency_ms
         return result
 
+    def run_simulation_on_latest_snapshot(
+        self,
+        prompt_tokens: int,
+    ) -> Optional[SimulationResult]:
+        run_critical_path = getattr(
+            self._worker, "run_simulation_on_latest_snapshot", None
+        )
+        if run_critical_path is None:
+            return None
+        summary = run_critical_path(int(prompt_tokens))
+        return self._result_from_summary(summary)
+
+    def latest_snapshot_summary(self) -> Optional[dict[str, int]]:
+        if self._latest_snapshot_summary is None:
+            return None
+        return dict(self._latest_snapshot_summary)
+
     def latest_snapshot(self) -> Optional[dict]:
         snapshot_bytes = self._worker.latest_snapshot()
         if snapshot_bytes is None:
@@ -976,6 +1047,7 @@ class NativeSchedulerSimulationWorker:
         return decode_scheduler_state_snapshot(snapshot_bytes)
 
     def clear_latest_snapshot(self) -> None:
+        self._latest_snapshot_summary = None
         self._worker.clear_latest_snapshot()
 
     def clear_latest_result(self) -> None:

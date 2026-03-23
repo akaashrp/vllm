@@ -3,7 +3,7 @@
 
 import hashlib
 from dataclasses import InitVar, field
-from typing import Any, Literal, Union
+from typing import Any, Literal, Optional, Union
 
 from pydantic import SkipValidation, model_validator
 from pydantic.dataclasses import dataclass
@@ -126,9 +126,12 @@ class SchedulerConfig:
     """Wait time simulation settings"""
     enable_wait_time_simulation: bool = True
     wait_time_simulation_interval_ms: int = 100
-    simulation_intercept: float = 0.024916565263221085
-    simulation_prefill_coeff: float = 0.000025313877177891524
-    simulation_decode_coeff: float = 0.000042442247775970685
+    simulation_intercept: float = 0
+    simulation_prefill_coeff: float = 0
+    simulation_decode_coeff: float = 0
+    simulation_sum_coeff: float = 0
+    output_length_model_path: Optional[str] = None
+    output_length_tail_quantile: float = 0.9
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
@@ -330,6 +333,10 @@ class SchedulerConfig:
             raise ValueError(
                 "wait_time_simulation_interval_ms must be greater than 0 when "
                 "enable_wait_time_simulation is True."
+            )
+        if not (0.0 < self.output_length_tail_quantile < 1.0):
+            raise ValueError(
+                "output_length_tail_quantile must be between 0 and 1."
             )
 
         return self

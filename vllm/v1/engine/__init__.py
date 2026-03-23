@@ -58,6 +58,10 @@ class EngineCoreRequest(
     cache_salt: Optional[str]
     data_parallel_rank: Optional[int]
     prompt_embeds: Optional[torch.Tensor] = None
+    predicted_output_tokens_p50: Optional[float] = None
+    predicted_output_tokens_tail: Optional[float] = None
+    predicted_output_tokens_quantile: Optional[float] = None
+    predicted_output_tokens_mean: Optional[float] = None
 
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.
