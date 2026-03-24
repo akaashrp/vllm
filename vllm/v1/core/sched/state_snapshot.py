@@ -73,8 +73,12 @@ class SchedulerStateSnapshot:
     resident_set_size: int = 0
     waiting_set_size: int = 0
     prefill_backlog_running_tokens: int = 0
+    prefill_backlog_running_sq_sum_tokens: int = 0
     prefill_backlog_waiting_tokens: int = 0
+    prefill_backlog_waiting_sq_sum_tokens: int = 0
     prefill_backlog_total_tokens: int = 0
+    prefill_backlog_total_sq_sum_tokens: int = 0
     decode_backlog_total_tokens: int = 0
     running_context_length_sum_snapshot: int = 0
+    running_context_length_sq_sum_snapshot: int = 0
     build_latency_ms: float = 0.0

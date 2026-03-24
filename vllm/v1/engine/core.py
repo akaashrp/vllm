@@ -164,8 +164,10 @@ class EngineCore:
                 # average_max_tokens=self.vllm_config.scheduler_config.average_max_tokens,
                 intercept=self.vllm_config.scheduler_config.simulation_intercept,
                 prefill_coeff=self.vllm_config.scheduler_config.simulation_prefill_coeff,
+                prefill_sq_coeff=self.vllm_config.scheduler_config.simulation_prefill_sq_coeff,
                 decode_coeff=self.vllm_config.scheduler_config.simulation_decode_coeff,
                 sum_coeff=self.vllm_config.scheduler_config.simulation_sum_coeff,
+                sum_sq_coeff=self.vllm_config.scheduler_config.simulation_sum_sq_coeff,
             )
             self.scheduler.set_snapshot_consumer(
                 self.scheduler_simulator.update_snapshot, interval_s=snapshot_interval

@@ -456,8 +456,12 @@ class EngineArgs:
     )
     simulation_intercept: float = SchedulerConfig.simulation_intercept
     simulation_prefill_coeff: float = SchedulerConfig.simulation_prefill_coeff
+    simulation_prefill_sq_coeff: float = (
+        SchedulerConfig.simulation_prefill_sq_coeff
+    )
     simulation_decode_coeff: float = SchedulerConfig.simulation_decode_coeff
     simulation_sum_coeff: float = SchedulerConfig.simulation_sum_coeff
+    simulation_sum_sq_coeff: float = SchedulerConfig.simulation_sum_sq_coeff
     output_length_model_path: Optional[str] = SchedulerConfig.output_length_model_path
     output_length_tail_quantile: float = SchedulerConfig.output_length_tail_quantile
 
@@ -1044,12 +1048,20 @@ class EngineArgs:
             **scheduler_kwargs["simulation_prefill_coeff"],
         )
         scheduler_group.add_argument(
+            "--simulation-prefill-sq-coeff",
+            **scheduler_kwargs["simulation_prefill_sq_coeff"],
+        )
+        scheduler_group.add_argument(
             "--simulation-decode-coeff",
             **scheduler_kwargs["simulation_decode_coeff"],
         )
         scheduler_group.add_argument(
             "--simulation-sum-coeff",
             **scheduler_kwargs["simulation_sum_coeff"],
+        )
+        scheduler_group.add_argument(
+            "--simulation-sum-sq-coeff",
+            **scheduler_kwargs["simulation_sum_sq_coeff"],
         )
         scheduler_group.add_argument(
             "--output-length-model-path",
@@ -1545,8 +1557,10 @@ class EngineArgs:
             wait_time_simulation_interval_ms=self.wait_time_simulation_interval_ms,
             simulation_intercept=self.simulation_intercept,
             simulation_prefill_coeff=self.simulation_prefill_coeff,
+            simulation_prefill_sq_coeff=self.simulation_prefill_sq_coeff,
             simulation_decode_coeff=self.simulation_decode_coeff,
             simulation_sum_coeff=self.simulation_sum_coeff,
+            simulation_sum_sq_coeff=self.simulation_sum_sq_coeff,
             output_length_model_path=self.output_length_model_path,
             output_length_tail_quantile=self.output_length_tail_quantile,
             is_multimodal_model=model_config.is_multimodal_model,

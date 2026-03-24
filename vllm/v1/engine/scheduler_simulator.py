@@ -137,11 +137,23 @@ def _snapshot_backlog_summary(snapshot: SchedulerStateSnapshot) -> dict[str, int
         "resident_set_size": int(snapshot.resident_set_size),
         "waiting_set_size": int(snapshot.waiting_set_size),
         "prefill_backlog_running_tokens": int(snapshot.prefill_backlog_running_tokens),
+        "prefill_backlog_running_sq_sum_tokens": int(
+            snapshot.prefill_backlog_running_sq_sum_tokens
+        ),
         "prefill_backlog_waiting_tokens": int(snapshot.prefill_backlog_waiting_tokens),
+        "prefill_backlog_waiting_sq_sum_tokens": int(
+            snapshot.prefill_backlog_waiting_sq_sum_tokens
+        ),
         "prefill_backlog_total_tokens": int(snapshot.prefill_backlog_total_tokens),
+        "prefill_backlog_total_sq_sum_tokens": int(
+            snapshot.prefill_backlog_total_sq_sum_tokens
+        ),
         "decode_backlog_total_tokens": int(snapshot.decode_backlog_total_tokens),
         "running_context_length_sum_snapshot": int(
             snapshot.running_context_length_sum_snapshot
+        ),
+        "running_context_length_sq_sum_snapshot": int(
+            snapshot.running_context_length_sq_sum_snapshot
         ),
     }
 
@@ -326,7 +338,13 @@ class SimulationContext:
         non_dummy_running = [req for req in self.running if req.request_id != "__DUMMY__"]
         non_dummy_waiting = [req for req in self.waiting if req.request_id != "__DUMMY__"]
         prefill_backlog_running = sum(req.prefill_remaining for req in non_dummy_running)
+        prefill_backlog_running_sq_sum = sum(
+            req.prefill_remaining * req.prefill_remaining for req in non_dummy_running
+        )
         prefill_backlog_waiting = sum(req.prefill_remaining for req in non_dummy_waiting)
+        prefill_backlog_waiting_sq_sum = sum(
+            req.prefill_remaining * req.prefill_remaining for req in non_dummy_waiting
+        )
         decode_backlog_total = sum(req.decode_remaining for req in non_dummy_running) + sum(
             req.decode_remaining for req in non_dummy_waiting
         )
@@ -341,9 +359,14 @@ class SimulationContext:
             "resident_set_size": len(non_dummy_running),
             "waiting_set_size": len(non_dummy_waiting),
             "prefill_backlog_running_tokens": int(prefill_backlog_running),
+            "prefill_backlog_running_sq_sum_tokens": int(prefill_backlog_running_sq_sum),
             "prefill_backlog_waiting_tokens": int(prefill_backlog_waiting),
+            "prefill_backlog_waiting_sq_sum_tokens": int(prefill_backlog_waiting_sq_sum),
             "prefill_backlog_total_tokens": int(
                 prefill_backlog_running + prefill_backlog_waiting
+            ),
+            "prefill_backlog_total_sq_sum_tokens": int(
+                prefill_backlog_running_sq_sum + prefill_backlog_waiting_sq_sum
             ),
             "decode_backlog_total_tokens": int(decode_backlog_total),
         }
@@ -487,13 +510,17 @@ class PythonSchedulerSimulationWorker:
         intercept: float,
         prefill_coeff: float,
         decode_coeff: float,
-        sum_coeff: float
+        sum_coeff: float,
+        prefill_sq_coeff: float = 0.0,
+        sum_sq_coeff: float = 0.0,
     ) -> None:
         self._interval_s = max(interval_s, 0.001)
         self._intercept = intercept
         self._prefill_coeff = prefill_coeff
+        self._prefill_sq_coeff = prefill_sq_coeff
         self._decode_coeff = decode_coeff
         self._sum_coeff = sum_coeff
+        self._sum_sq_coeff = sum_sq_coeff
         self._latest_snapshot: Optional[SchedulerStateSnapshot] = None
         self._latest_snapshot_summary: Optional[dict[str, int]] = None
         self._latest_result: Optional[SimulationResult] = None
@@ -581,10 +608,11 @@ class PythonSchedulerSimulationWorker:
     def _build_next_batch(
         self, 
         state: SimulationContext
-    ) -> Tuple[List[SimRequestState], List[int], int]:
+    ) -> Tuple[List[SimRequestState], List[int], int, int]:
         batch_requests: List[SimRequestState] = []
         batch_tokens: List[int] = []
         sum_context_length: int = 0
+        sum_sq_tokens: int = 0
         config = state.snapshot.config
         
         max_model_len = config.max_model_len
@@ -674,7 +702,9 @@ class PythonSchedulerSimulationWorker:
             
             batch_requests.append(request)
             batch_tokens.append(num_new_tokens)
-            sum_context_length += request.num_tokens
+            request_tokens = request.num_tokens
+            sum_context_length += request_tokens
+            sum_sq_tokens += request_tokens * request_tokens
             
         # BODEN: handle differently based on FCFS vs priority
         if config.policy == "priority":
@@ -771,7 +801,9 @@ class PythonSchedulerSimulationWorker:
                     
                 batch_requests.append(request)
                 batch_tokens.append(num_new_tokens)
-                sum_context_length += request.num_tokens
+                request_tokens = request.num_tokens
+                sum_context_length += request_tokens
+                sum_sq_tokens += request_tokens * request_tokens
                 
         if skipped_waiting_requests:
             if config.policy == "priority":
@@ -805,15 +837,16 @@ class PythonSchedulerSimulationWorker:
         
         # BODEN: summary metadata is still empty
             
-        return batch_requests, batch_tokens, sum_context_length
+        return batch_requests, batch_tokens, sum_context_length, sum_sq_tokens
         
     def _apply_batch_result(
         self,
         state: SimulationContext,
         batch_requests: List[SimRequestState],
         batch_tokens: List[int],
-    ) -> Tuple[int, int, List[SimRequestState], List[SimRequestState]]:
+    ) -> Tuple[int, int, int, List[SimRequestState], List[SimRequestState]]:
         total_prefill = 0
+        total_prefill_sq_sum = 0
         total_decode = 0
         prefill_done: List[SimRequestState] = []
         finished: List[SimRequestState] = []
@@ -850,6 +883,7 @@ class PythonSchedulerSimulationWorker:
             decode_before = request.decode_remaining
             consumed_prefill, consumed_decode = request.consume(num_tokens_scheduled)
             total_prefill += consumed_prefill
+            total_prefill_sq_sum += consumed_prefill * consumed_prefill
             total_decode += consumed_decode
 
             # Simulate emission of decode tokens after the batch finishes:
@@ -891,17 +925,37 @@ class PythonSchedulerSimulationWorker:
             elif config.policy == "fcfs":
                 state.waiting = remove_all(state.waiting, stopped_preempted_reqs)
 
-        return total_prefill, total_decode, prefill_done, stopped_running_reqs.union(stopped_preempted_reqs)
+        return (
+            total_prefill,
+            total_prefill_sq_sum,
+            total_decode,
+            prefill_done,
+            stopped_running_reqs.union(stopped_preempted_reqs),
+        )
 
-    def _estimate_batch_time(self, num_prefill_tokens: int, num_decode_tokens: int, sum_context_length: int, intercept: float, 
-                             prefill_coeff: float, decode_coeff: float, sum_coeff: float) -> float:
+    def _estimate_batch_time(
+        self,
+        num_prefill_tokens: int,
+        num_prefill_sq_sum: int,
+        num_decode_tokens: int,
+        sum_context_length: int,
+        sum_sq_tokens: int,
+        intercept: float,
+        prefill_coeff: float,
+        prefill_sq_coeff: float,
+        decode_coeff: float,
+        sum_coeff: float,
+        sum_sq_coeff: float,
+    ) -> float:
         """Simple deterministic estimate for per-batch latency in milliseconds."""
         assert num_prefill_tokens > 0 or num_decode_tokens > 0
         return (
             intercept
             + (prefill_coeff * num_prefill_tokens)
+            + (prefill_sq_coeff * num_prefill_sq_sum)
             + (decode_coeff * num_decode_tokens)
             + (sum_coeff * sum_context_length)
+            + (sum_sq_coeff * sum_sq_tokens)
         ) * 1000.0
 
     def _run_simulation(self, snapshot: SchedulerStateSnapshot) -> SimulationResult:
@@ -911,7 +965,12 @@ class PythonSchedulerSimulationWorker:
         idle_ticks = 0
         max_idle_ticks = 4
         while True:
-            batch_requests, batch_tokens, sum_context_length = self._build_next_batch(state)
+            (
+                batch_requests,
+                batch_tokens,
+                sum_context_length,
+                sum_sq_tokens,
+            ) = self._build_next_batch(state)
             if any(req.request_id == "__DUMMY__" for req in batch_requests):
                 break
             
@@ -925,18 +984,23 @@ class PythonSchedulerSimulationWorker:
             start_time = state.current_time_ms
             (
                 batch_prefill,
+                batch_prefill_sq_sum,
                 batch_decode,
                 _,
                 finished_reqs,
             ) = self._apply_batch_result(state, batch_requests, batch_tokens)
             batch_time = self._estimate_batch_time(
                 batch_prefill,
+                batch_prefill_sq_sum,
                 batch_decode,
                 sum_context_length,
+                sum_sq_tokens,
                 self._intercept,
                 self._prefill_coeff,
+                self._prefill_sq_coeff,
                 self._decode_coeff,
                 self._sum_coeff,
+                self._sum_sq_coeff,
             )
             end_time = start_time + batch_time
             
@@ -968,19 +1032,38 @@ class NativeSchedulerSimulationWorker:
         intercept: float,
         prefill_coeff: float,
         decode_coeff: float,
-        sum_coeff: float
+        sum_coeff: float,
+        prefill_sq_coeff: float = 0.0,
+        sum_sq_coeff: float = 0.0,
     ) -> None:
         if _scheduler_sim_native is None:
             raise RuntimeError(
                 "Native scheduler simulator extension is not available."
             )
-        self._worker = _scheduler_sim_native.SchedulerSimulationWorker(
-            interval_s=interval_s,
-            intercept=intercept,
-            prefill_coeff=prefill_coeff,
-            decode_coeff=decode_coeff,
-            sum_coeff=sum_coeff,
-        )
+        try:
+            self._worker = _scheduler_sim_native.SchedulerSimulationWorker(
+                interval_s=interval_s,
+                intercept=intercept,
+                prefill_coeff=prefill_coeff,
+                prefill_sq_coeff=prefill_sq_coeff,
+                decode_coeff=decode_coeff,
+                sum_coeff=sum_coeff,
+                sum_sq_coeff=sum_sq_coeff,
+            )
+        except TypeError:
+            if abs(prefill_sq_coeff) > 0.0 or abs(sum_sq_coeff) > 0.0:
+                logger.warning(
+                    "Native scheduler simulator extension does not yet support "
+                    "quadratic coefficients; prefill_sq_coeff and "
+                    "sum_sq_coeff will be ignored."
+                )
+            self._worker = _scheduler_sim_native.SchedulerSimulationWorker(
+                interval_s=interval_s,
+                intercept=intercept,
+                prefill_coeff=prefill_coeff,
+                decode_coeff=decode_coeff,
+                sum_coeff=sum_coeff,
+            )
         self._latest_snapshot_summary: Optional[dict[str, int]] = None
         logger.info("Scheduler simulator using native backend")
 

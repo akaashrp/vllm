@@ -128,8 +128,10 @@ class SchedulerConfig:
     wait_time_simulation_interval_ms: int = 100
     simulation_intercept: float = 0
     simulation_prefill_coeff: float = 0
+    simulation_prefill_sq_coeff: float = 0
     simulation_decode_coeff: float = 0
     simulation_sum_coeff: float = 0
+    simulation_sum_sq_coeff: float = 0
     output_length_model_path: Optional[str] = None
     output_length_tail_quantile: float = 0.9
 

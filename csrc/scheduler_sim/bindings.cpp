@@ -310,6 +310,17 @@ struct SchedulerStateSnapshotNative {
   SchedulerConfigSnapshotNative config;
   SchedulerKVCacheSnapshotNative kv_cache_config;
   SchedulerParallelSnapshotNative parallel_config;
+  int64_t resident_set_size = 0;
+  int64_t waiting_set_size = 0;
+  int64_t prefill_backlog_running_tokens = 0;
+  int64_t prefill_backlog_running_sq_sum_tokens = 0;
+  int64_t prefill_backlog_waiting_tokens = 0;
+  int64_t prefill_backlog_waiting_sq_sum_tokens = 0;
+  int64_t prefill_backlog_total_tokens = 0;
+  int64_t prefill_backlog_total_sq_sum_tokens = 0;
+  int64_t decode_backlog_total_tokens = 0;
+  int64_t running_context_length_sum_snapshot = 0;
+  int64_t running_context_length_sq_sum_snapshot = 0;
   double build_latency_ms = 0.0;
 };
 
@@ -708,6 +719,7 @@ struct BatchBuildOutput {
   std::vector<SimRequestState*> batch_requests;
   std::vector<int64_t> batch_tokens;
   int64_t sum_context_length = 0;
+  int64_t sum_sq_tokens = 0;
 };
 
 static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
@@ -816,7 +828,9 @@ static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
 
     batch_requests.push_back(request);
     batch_tokens.push_back(num_new_tokens);
-    output.sum_context_length += request->num_tokens();
+    int64_t request_tokens = request->num_tokens();
+    output.sum_context_length += request_tokens;
+    output.sum_sq_tokens += request_tokens * request_tokens;
   }
 
   std::deque<SimRequestState*> skipped_waiting_requests;
@@ -917,7 +931,9 @@ static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
 
       batch_requests.push_back(request);
       batch_tokens.push_back(num_new_tokens);
-      output.sum_context_length += request->num_tokens();
+      int64_t request_tokens = request->num_tokens();
+      output.sum_context_length += request_tokens;
+      output.sum_sq_tokens += request_tokens * request_tokens;
     }
   }
 
@@ -956,6 +972,7 @@ static BatchBuildOutput BuildNextBatch(SimulationContext& state) {
 
 struct ApplyBatchOutput {
   int64_t total_prefill = 0;
+  int64_t total_prefill_sq_sum = 0;
   int64_t total_decode = 0;
   std::vector<SimRequestState*> prefill_done;
   std::vector<SimRequestState*> finished;
@@ -984,6 +1001,7 @@ static ApplyBatchOutput ApplyBatchResultNative(
     int64_t consumed_prefill = consumed.first;
     int64_t consumed_decode = consumed.second;
     result.total_prefill += consumed_prefill;
+    result.total_prefill_sq_sum += consumed_prefill * consumed_prefill;
     result.total_decode += consumed_decode;
 
     int64_t emitted_decode = consumed_decode;
@@ -1030,25 +1048,34 @@ static ApplyBatchOutput ApplyBatchResultNative(
 }
 
 static double EstimateBatchTime(int64_t num_prefill_tokens,
+                                int64_t num_prefill_sq_sum,
                                 int64_t num_decode_tokens,
                                 int64_t sum_context_length,
+                                int64_t sum_sq_tokens,
                                 double intercept,
                                 double prefill_coeff,
+                                double prefill_sq_coeff,
                                 double decode_coeff,
-                                double sum_coeff) {
+                                double sum_coeff,
+                                double sum_sq_coeff) {
   if (num_prefill_tokens <= 0 && num_decode_tokens <= 0) {
     throw std::runtime_error("Batch must have at least one token");
   }
   return (intercept + (prefill_coeff * num_prefill_tokens) +
-         (decode_coeff * num_decode_tokens) + (sum_coeff * sum_context_length)) * 1000;
+          (prefill_sq_coeff * num_prefill_sq_sum) +
+          (decode_coeff * num_decode_tokens) +
+          (sum_coeff * sum_context_length) + (sum_sq_coeff * sum_sq_tokens)) *
+         1000;
 }
 
 static SimulationMetadataNative RunSimulationNative(
     const SchedulerStateSnapshotNative& snapshot,
     double intercept,
     double prefill_coeff,
+    double prefill_sq_coeff,
     double decode_coeff,
     double sum_coeff,
+    double sum_sq_coeff,
     std::optional<int64_t> dummy_prompt_tokens_override = std::nullopt) {
   SimulationContext state(snapshot, dummy_prompt_tokens_override);
   int idle_ticks = 0;
@@ -1081,8 +1108,10 @@ static SimulationMetadataNative RunSimulationNative(
     auto apply_result =
         ApplyBatchResultNative(state, batch.batch_requests, batch.batch_tokens);
     double batch_time = EstimateBatchTime(
-        apply_result.total_prefill, apply_result.total_decode, batch.sum_context_length, intercept,
-        prefill_coeff, decode_coeff, sum_coeff);
+        apply_result.total_prefill, apply_result.total_prefill_sq_sum,
+        apply_result.total_decode, batch.sum_context_length, batch.sum_sq_tokens,
+        intercept, prefill_coeff, prefill_sq_coeff, decode_coeff, sum_coeff,
+        sum_sq_coeff);
     double end_time = start_time + batch_time;
 
     for (SimRequestState* req : apply_result.finished) {
@@ -1127,6 +1156,17 @@ static const MsgpackValue& GetMapValue(const MsgpackValue& map,
     }
   }
   throw std::runtime_error("Missing key in snapshot: " + key);
+}
+
+static const MsgpackValue* FindMapValue(const MsgpackValue& map,
+                                        const std::string& key) {
+  RequireKind(map, MsgpackValue::Kind::Map, "map");
+  for (const auto& entry : map.map_value) {
+    if (entry.first == key) {
+      return &entry.second;
+    }
+  }
+  return nullptr;
 }
 
 static int64_t ToInt(const MsgpackValue& value, const char* field) {
@@ -1327,6 +1367,57 @@ static SchedulerStateSnapshotNative ParseSchedulerSnapshot(
       ParseKVConfig(GetMapValue(value, "kv_cache_config"));
   snapshot.parallel_config =
       ParseParallelConfig(GetMapValue(value, "parallel_config"));
+  if (const auto* field = FindMapValue(value, "resident_set_size")) {
+    snapshot.resident_set_size = ToInt(*field, "resident_set_size");
+  }
+  if (const auto* field = FindMapValue(value, "waiting_set_size")) {
+    snapshot.waiting_set_size = ToInt(*field, "waiting_set_size");
+  }
+  if (const auto* field =
+          FindMapValue(value, "prefill_backlog_running_tokens")) {
+    snapshot.prefill_backlog_running_tokens =
+        ToInt(*field, "prefill_backlog_running_tokens");
+  }
+  if (const auto* field =
+          FindMapValue(value, "prefill_backlog_running_sq_sum_tokens")) {
+    snapshot.prefill_backlog_running_sq_sum_tokens =
+        ToInt(*field, "prefill_backlog_running_sq_sum_tokens");
+  }
+  if (const auto* field =
+          FindMapValue(value, "prefill_backlog_waiting_tokens")) {
+    snapshot.prefill_backlog_waiting_tokens =
+        ToInt(*field, "prefill_backlog_waiting_tokens");
+  }
+  if (const auto* field =
+          FindMapValue(value, "prefill_backlog_waiting_sq_sum_tokens")) {
+    snapshot.prefill_backlog_waiting_sq_sum_tokens =
+        ToInt(*field, "prefill_backlog_waiting_sq_sum_tokens");
+  }
+  if (const auto* field =
+          FindMapValue(value, "prefill_backlog_total_tokens")) {
+    snapshot.prefill_backlog_total_tokens =
+        ToInt(*field, "prefill_backlog_total_tokens");
+  }
+  if (const auto* field =
+          FindMapValue(value, "prefill_backlog_total_sq_sum_tokens")) {
+    snapshot.prefill_backlog_total_sq_sum_tokens =
+        ToInt(*field, "prefill_backlog_total_sq_sum_tokens");
+  }
+  if (const auto* field =
+          FindMapValue(value, "decode_backlog_total_tokens")) {
+    snapshot.decode_backlog_total_tokens =
+        ToInt(*field, "decode_backlog_total_tokens");
+  }
+  if (const auto* field =
+          FindMapValue(value, "running_context_length_sum_snapshot")) {
+    snapshot.running_context_length_sum_snapshot =
+        ToInt(*field, "running_context_length_sum_snapshot");
+  }
+  if (const auto* field =
+          FindMapValue(value, "running_context_length_sq_sum_snapshot")) {
+    snapshot.running_context_length_sq_sum_snapshot =
+        ToInt(*field, "running_context_length_sq_sum_snapshot");
+  }
   snapshot.build_latency_ms =
       ToDouble(GetMapValue(value, "build_latency_ms"), "build_latency_ms");
   return snapshot;
@@ -1426,6 +1517,24 @@ static py::dict ToPyDict(const SchedulerStateSnapshotNative& snapshot) {
   dict["config"] = ToPyDict(snapshot.config);
   dict["kv_cache_config"] = ToPyDict(snapshot.kv_cache_config);
   dict["parallel_config"] = ToPyDict(snapshot.parallel_config);
+  dict["resident_set_size"] = snapshot.resident_set_size;
+  dict["waiting_set_size"] = snapshot.waiting_set_size;
+  dict["prefill_backlog_running_tokens"] =
+      snapshot.prefill_backlog_running_tokens;
+  dict["prefill_backlog_running_sq_sum_tokens"] =
+      snapshot.prefill_backlog_running_sq_sum_tokens;
+  dict["prefill_backlog_waiting_tokens"] =
+      snapshot.prefill_backlog_waiting_tokens;
+  dict["prefill_backlog_waiting_sq_sum_tokens"] =
+      snapshot.prefill_backlog_waiting_sq_sum_tokens;
+  dict["prefill_backlog_total_tokens"] = snapshot.prefill_backlog_total_tokens;
+  dict["prefill_backlog_total_sq_sum_tokens"] =
+      snapshot.prefill_backlog_total_sq_sum_tokens;
+  dict["decode_backlog_total_tokens"] = snapshot.decode_backlog_total_tokens;
+  dict["running_context_length_sum_snapshot"] =
+      snapshot.running_context_length_sum_snapshot;
+  dict["running_context_length_sq_sum_snapshot"] =
+      snapshot.running_context_length_sq_sum_snapshot;
   dict["build_latency_ms"] = snapshot.build_latency_ms;
   return dict;
 }
@@ -1439,12 +1548,16 @@ class SchedulerSimulationWorkerStub {
                                 double intercept,
                                 double prefill_coeff,
                                 double decode_coeff,
-                                double sum_coeff)
+                                double sum_coeff,
+                                double prefill_sq_coeff = 0.0,
+                                double sum_sq_coeff = 0.0)
       : interval_s_(interval_s),
         intercept_(intercept),
         prefill_coeff_(prefill_coeff),
         decode_coeff_(decode_coeff),
-        sum_coeff_(sum_coeff) {}
+        sum_coeff_(sum_coeff),
+        prefill_sq_coeff_(prefill_sq_coeff),
+        sum_sq_coeff_(sum_sq_coeff) {}
 
   ~SchedulerSimulationWorkerStub() { StopThread(); }
 
@@ -1498,7 +1611,9 @@ class SchedulerSimulationWorkerStub {
     auto snapshot = ParseSchedulerSnapshot(parser.parse());
     try {
       auto metadata = RunSimulationNative(snapshot, intercept_,
-                                          prefill_coeff_, decode_coeff_, sum_coeff_);
+                                          prefill_coeff_, prefill_sq_coeff_,
+                                          decode_coeff_, sum_coeff_,
+                                          sum_sq_coeff_);
       return MetadataToPyDict(metadata);
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string("Scheduler simulation failed: ") +
@@ -1531,7 +1646,8 @@ class SchedulerSimulationWorkerStub {
     try {
       metadata =
           RunSimulationNative(*snapshot, intercept_, prefill_coeff_,
-                              decode_coeff_, sum_coeff_, prompt_tokens);
+                              prefill_sq_coeff_, decode_coeff_, sum_coeff_,
+                              sum_sq_coeff_, prompt_tokens);
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string("Scheduler simulation failed: ") +
                                e.what());
@@ -1638,7 +1754,9 @@ class SchedulerSimulationWorkerStub {
       bool simulation_ok = true;
       try {
         metadata = RunSimulationNative(*snapshot, intercept_,
-                                       prefill_coeff_, decode_coeff_, sum_coeff_);
+                                       prefill_coeff_, prefill_sq_coeff_,
+                                       decode_coeff_, sum_coeff_,
+                                       sum_sq_coeff_);
       } catch (const std::exception& e) {
         simulation_ok = false;
         std::fprintf(stderr,
@@ -1681,6 +1799,8 @@ class SchedulerSimulationWorkerStub {
   double prefill_coeff_;
   double decode_coeff_;
   double sum_coeff_;
+  double prefill_sq_coeff_;
+  double sum_sq_coeff_;
   bool has_snapshot_ = false;
   std::string latest_snapshot_bytes_;
   std::shared_ptr<const SchedulerStateSnapshotNative> parsed_snapshot_;
@@ -1699,12 +1819,14 @@ class SchedulerSimulationWorkerStub {
 PYBIND11_MODULE(_scheduler_sim, m) {
   py::class_<vllm::scheduler_sim::SchedulerSimulationWorkerStub>(
       m, "SchedulerSimulationWorker")
-      .def(py::init<double, double, double, double, double>(),
+      .def(py::init<double, double, double, double, double, double, double>(),
            py::arg("interval_s"),
            py::arg("intercept"),
            py::arg("prefill_coeff"),
            py::arg("decode_coeff"),
-           py::arg("sum_coeff"))
+           py::arg("sum_coeff"),
+           py::arg("prefill_sq_coeff") = 0.0,
+           py::arg("sum_sq_coeff") = 0.0)
       .def("start", &vllm::scheduler_sim::SchedulerSimulationWorkerStub::start)
       .def("stop", &vllm::scheduler_sim::SchedulerSimulationWorkerStub::stop)
       .def("update_snapshot",

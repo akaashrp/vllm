@@ -1468,9 +1468,12 @@ class Scheduler(SchedulerInterface):
         )
 
         prefill_backlog_running = 0
+        prefill_backlog_running_sq_sum = 0
         prefill_backlog_waiting = 0
+        prefill_backlog_waiting_sq_sum = 0
         decode_backlog_total = 0
         running_context_length_sum_snapshot = 0
+        running_context_length_sq_sum_snapshot = 0
 
         max_arrival_time = -1
         for request_id, request in self.requests.items():
@@ -1525,12 +1528,14 @@ class Scheduler(SchedulerInterface):
             decode_remaining = max(num_output_target_tokens - num_output_processed_tokens, 0)
             if request_id in running_id_set:
                 prefill_backlog_running += prefill_remaining
+                prefill_backlog_running_sq_sum += prefill_remaining * prefill_remaining
                 decode_backlog_total += decode_remaining
-                running_context_length_sum_snapshot += (
-                    num_prompt_tokens + num_output_processed_tokens
-                )
+                context_length = num_prompt_tokens + num_output_processed_tokens
+                running_context_length_sum_snapshot += context_length
+                running_context_length_sq_sum_snapshot += context_length * context_length
             elif request_id in waiting_id_set:
                 prefill_backlog_waiting += prefill_remaining
+                prefill_backlog_waiting_sq_sum += prefill_remaining * prefill_remaining
                 decode_backlog_total += decode_remaining
 
             requests[request_id] = RequestStateSnapshot(
@@ -1572,6 +1577,9 @@ class Scheduler(SchedulerInterface):
 
         waiting_request_ids = waiting_request_ids + [dummy_request_id]
         prefill_backlog_total = prefill_backlog_running + prefill_backlog_waiting
+        prefill_backlog_total_sq_sum = (
+            prefill_backlog_running_sq_sum + prefill_backlog_waiting_sq_sum
+        )
 
         block_pool = self.kv_cache_manager.block_pool
         kv_cache_config_snapshot = SchedulerKVCacheSnapshot(
@@ -1601,10 +1609,16 @@ class Scheduler(SchedulerInterface):
             resident_set_size=len(running_id_set),
             waiting_set_size=len(waiting_id_set),
             prefill_backlog_running_tokens=int(prefill_backlog_running),
+            prefill_backlog_running_sq_sum_tokens=int(prefill_backlog_running_sq_sum),
             prefill_backlog_waiting_tokens=int(prefill_backlog_waiting),
+            prefill_backlog_waiting_sq_sum_tokens=int(prefill_backlog_waiting_sq_sum),
             prefill_backlog_total_tokens=int(prefill_backlog_total),
+            prefill_backlog_total_sq_sum_tokens=int(prefill_backlog_total_sq_sum),
             decode_backlog_total_tokens=int(decode_backlog_total),
             running_context_length_sum_snapshot=int(running_context_length_sum_snapshot),
+            running_context_length_sq_sum_snapshot=int(
+                running_context_length_sq_sum_snapshot
+            ),
         )
 
     def add_request(self, request: Request) -> None:
