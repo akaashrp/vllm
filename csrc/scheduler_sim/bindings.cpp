@@ -1,19 +1,28 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #include <algorithm>
+#include <array>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <fcntl.h>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -324,6 +333,14 @@ struct SchedulerStateSnapshotNative {
   double build_latency_ms = 0.0;
 };
 
+enum class SimulationStopModeNative {
+  kDrain,
+  kFirstSchedule,
+  kPrefillDone,
+};
+
+static constexpr char kProbeRequestId[] = "__PROBE__";
+
 class SimRequestState {
  public:
   explicit SimRequestState(const RequestStateSnapshotNative& snapshot)
@@ -414,6 +431,14 @@ class SimRequestState {
     }
   }
 
+  const std::optional<double>& first_scheduled_time_ms() const {
+    return first_scheduled_time_ms_;
+  }
+
+  const std::optional<double>& prefill_done_time_ms() const {
+    return prefill_done_time_ms_;
+  }
+
   bool is_finished() const {
     return prefill_remaining() == 0 && decode_remaining() == 0;
   }
@@ -449,8 +474,9 @@ class SimulationContext {
  public:
   explicit SimulationContext(
       const SchedulerStateSnapshotNative& snapshot,
-      std::optional<int64_t> dummy_prompt_tokens_override = std::nullopt)
+      std::optional<std::string> probe_request_id = std::nullopt)
       : snapshot_(snapshot),
+        probe_request_id_(std::move(probe_request_id)),
         kv_free_blocks_(snapshot.kv_cache_config.kv_cache_free_blocks),
         current_time_ms_(0.0),
         total_prefill_tokens_(0),
@@ -458,12 +484,7 @@ class SimulationContext {
         num_batches_(0) {
     requests_.reserve(snapshot.requests.size());
     for (const auto& entry : snapshot.requests) {
-      RequestStateSnapshotNative request_snapshot = entry.second;
-      if (entry.first == "__DUMMY__" && dummy_prompt_tokens_override.has_value()) {
-        request_snapshot.num_prompt_tokens =
-            std::max<int64_t>(0, *dummy_prompt_tokens_override);
-      }
-      requests_.emplace(entry.first, SimRequestState(request_snapshot));
+      requests_.emplace(entry.first, SimRequestState(entry.second));
       kv_allocations_[entry.first] =
           entry.second.kv_block_counts.empty()
               ? std::vector<int64_t>(num_kv_groups(), 0)
@@ -483,9 +504,8 @@ class SimulationContext {
     }
     running_at_snapshot_ = snapshot.running_request_ids.size();
     queued_at_snapshot_ =
-        snapshot.waiting_request_ids.size() > 0
-            ? static_cast<int64_t>(snapshot.waiting_request_ids.size() - 1)
-            : 0;
+        static_cast<int64_t>(snapshot.waiting_request_ids.size()) -
+        (probe_request_id_.has_value() ? 1 : 0);
   }
 
   const SchedulerStateSnapshotNative& snapshot() const { return snapshot_; }
@@ -507,6 +527,37 @@ class SimulationContext {
 
   int64_t running_at_snapshot() const { return running_at_snapshot_; }
   int64_t queued_at_snapshot() const { return queued_at_snapshot_; }
+  const std::optional<std::string>& probe_request_id() const {
+    return probe_request_id_;
+  }
+
+  int64_t visible_running_size() const {
+    int64_t total = 0;
+    for (const SimRequestState* request : running_) {
+      if (request == nullptr) {
+        continue;
+      }
+      if (probe_request_id_ && request->request_id() == *probe_request_id_) {
+        continue;
+      }
+      ++total;
+    }
+    return total;
+  }
+
+  int64_t visible_waiting_size() const {
+    int64_t total = 0;
+    for (const SimRequestState* request : waiting_) {
+      if (request == nullptr) {
+        continue;
+      }
+      if (probe_request_id_ && request->request_id() == *probe_request_id_) {
+        continue;
+      }
+      ++total;
+    }
+    return total;
+  }
 
   SimRequestState* get_request(const std::string& request_id) {
     return find_request(request_id);
@@ -648,6 +699,7 @@ class SimulationContext {
   int64_t num_batches_;
   int64_t queued_at_snapshot_ = 0;
   int64_t running_at_snapshot_ = 0;
+  std::optional<std::string> probe_request_id_;
   std::vector<int64_t> block_requirement_scratch_;
   std::vector<int64_t> block_additional_scratch_;
 
@@ -682,6 +734,229 @@ struct SimulationOutcome {
   SimulationMetadataNative metadata;
 };
 
+constexpr char kSnapshotShmMagic[] = "VLLMSHM1";
+constexpr uint32_t kSnapshotShmVersion = 1;
+constexpr uint32_t kSnapshotShmHeaderSize = 112;
+constexpr int kSnapshotShmReadMaxRetries = 32;
+constexpr int64_t kDefaultSnapshotWatcherPollIntervalMs = 1;
+
+struct SnapshotShmHeaderNative {
+  uint64_t sequence = 0;
+  uint64_t snapshot_version = 0;
+  double created_at = 0.0;
+  uint64_t payload_size = 0;
+  double prefill_backlog_total_tokens = 0.0;
+  double build_latency_ms = 0.0;
+};
+
+template <typename T>
+static T ReadUnalignedLittleEndian(const char* data) {
+  T value;
+  std::memcpy(&value, data, sizeof(T));
+  return value;
+}
+
+static SnapshotShmHeaderNative DecodeSnapshotShmHeaderNative(
+    const char* data,
+    size_t size) {
+  if (size < kSnapshotShmHeaderSize) {
+    throw std::runtime_error("Snapshot SHM header is truncated");
+  }
+  if (std::memcmp(data, kSnapshotShmMagic, sizeof(kSnapshotShmMagic) - 1) != 0) {
+    throw std::runtime_error("Snapshot SHM magic mismatch");
+  }
+  const uint32_t version = ReadUnalignedLittleEndian<uint32_t>(data + 8);
+  if (version != kSnapshotShmVersion) {
+    throw std::runtime_error("Snapshot SHM version mismatch");
+  }
+  const uint32_t header_size =
+      ReadUnalignedLittleEndian<uint32_t>(data + 12);
+  if (header_size != kSnapshotShmHeaderSize) {
+    throw std::runtime_error("Snapshot SHM header size mismatch");
+  }
+
+  SnapshotShmHeaderNative header;
+  header.sequence = ReadUnalignedLittleEndian<uint64_t>(data + 16);
+  header.snapshot_version = ReadUnalignedLittleEndian<uint64_t>(data + 24);
+  header.created_at = ReadUnalignedLittleEndian<double>(data + 32);
+  header.payload_size = ReadUnalignedLittleEndian<uint64_t>(data + 40);
+  header.prefill_backlog_total_tokens =
+      ReadUnalignedLittleEndian<double>(data + 48);
+  header.build_latency_ms = ReadUnalignedLittleEndian<double>(data + 56);
+  return header;
+}
+
+static std::optional<std::string> ReadSnapshotPayloadFromMappedShm(
+    const char* base,
+    size_t mapping_size,
+    SnapshotShmHeaderNative* header_out) {
+  if (mapping_size < kSnapshotShmHeaderSize) {
+    throw std::runtime_error("Snapshot SHM mapping is smaller than header");
+  }
+  std::array<char, kSnapshotShmHeaderSize> header_before{};
+  std::array<char, kSnapshotShmHeaderSize> header_after{};
+  for (int attempt = 0; attempt < kSnapshotShmReadMaxRetries; ++attempt) {
+    std::memcpy(header_before.data(), base, kSnapshotShmHeaderSize);
+    SnapshotShmHeaderNative parsed_before =
+        DecodeSnapshotShmHeaderNative(header_before.data(), header_before.size());
+    if ((parsed_before.sequence & 1U) != 0U) {
+      continue;
+    }
+    if (parsed_before.payload_size >
+        static_cast<uint64_t>(mapping_size - kSnapshotShmHeaderSize)) {
+      throw std::runtime_error("Snapshot SHM payload size is out of bounds");
+    }
+    std::string payload(parsed_before.payload_size, '\0');
+    if (!payload.empty()) {
+      std::memcpy(payload.data(), base + kSnapshotShmHeaderSize, payload.size());
+    }
+    std::memcpy(header_after.data(), base, kSnapshotShmHeaderSize);
+    if (std::memcmp(header_before.data(), header_after.data(),
+                    kSnapshotShmHeaderSize) != 0) {
+      continue;
+    }
+    SnapshotShmHeaderNative parsed_after =
+        DecodeSnapshotShmHeaderNative(header_after.data(), header_after.size());
+    if ((parsed_after.sequence & 1U) != 0U) {
+      continue;
+    }
+    if (header_out != nullptr) {
+      *header_out = parsed_after;
+    }
+    return payload;
+  }
+  return std::nullopt;
+}
+
+static std::optional<SnapshotShmHeaderNative> ReadSnapshotHeaderFromMappedShm(
+    const char* base,
+    size_t mapping_size) {
+  if (mapping_size < kSnapshotShmHeaderSize) {
+    throw std::runtime_error("Snapshot SHM mapping is smaller than header");
+  }
+  std::array<char, kSnapshotShmHeaderSize> header_before{};
+  std::array<char, kSnapshotShmHeaderSize> header_after{};
+  for (int attempt = 0; attempt < kSnapshotShmReadMaxRetries; ++attempt) {
+    std::memcpy(header_before.data(), base, kSnapshotShmHeaderSize);
+    SnapshotShmHeaderNative parsed_before =
+        DecodeSnapshotShmHeaderNative(header_before.data(), header_before.size());
+    if ((parsed_before.sequence & 1U) != 0U) {
+      continue;
+    }
+    std::memcpy(header_after.data(), base, kSnapshotShmHeaderSize);
+    if (std::memcmp(header_before.data(), header_after.data(),
+                    kSnapshotShmHeaderSize) != 0) {
+      continue;
+    }
+    SnapshotShmHeaderNative parsed_after =
+        DecodeSnapshotShmHeaderNative(header_after.data(), header_after.size());
+    if ((parsed_after.sequence & 1U) != 0U) {
+      continue;
+    }
+    return parsed_after;
+  }
+  return std::nullopt;
+}
+
+struct SnapshotShmMapping {
+  int fd = -1;
+  size_t size = 0;
+  char* ptr = nullptr;
+
+  SnapshotShmMapping() = default;
+  SnapshotShmMapping(const SnapshotShmMapping&) = delete;
+  SnapshotShmMapping& operator=(const SnapshotShmMapping&) = delete;
+
+  SnapshotShmMapping(SnapshotShmMapping&& other) noexcept
+      : fd(other.fd), size(other.size), ptr(other.ptr) {
+    other.fd = -1;
+    other.size = 0;
+    other.ptr = nullptr;
+  }
+
+  SnapshotShmMapping& operator=(SnapshotShmMapping&& other) noexcept {
+    if (this == &other) {
+      return *this;
+    }
+    close();
+    fd = other.fd;
+    size = other.size;
+    ptr = other.ptr;
+    other.fd = -1;
+    other.size = 0;
+    other.ptr = nullptr;
+    return *this;
+  }
+
+  ~SnapshotShmMapping() { close(); }
+
+  void close() {
+    if (ptr != nullptr) {
+      ::munmap(ptr, size);
+      ptr = nullptr;
+    }
+    if (fd >= 0) {
+      ::close(fd);
+      fd = -1;
+    }
+    size = 0;
+  }
+};
+
+static std::string NormalizeSnapshotShmName(const std::string& name) {
+  if (name.empty()) {
+    throw std::runtime_error("snapshot SHM name must be non-empty");
+  }
+  if (name.front() == '/') {
+    return name;
+  }
+  return "/" + name;
+}
+
+static std::optional<SnapshotShmMapping> TryOpenSnapshotShmMapping(
+    const std::string& shm_name,
+    size_t expected_size_bytes) {
+  const std::string normalized_name = NormalizeSnapshotShmName(shm_name);
+  const int fd = ::shm_open(normalized_name.c_str(), O_RDONLY, 0);
+  if (fd < 0) {
+    if (errno == ENOENT) {
+      return std::nullopt;
+    }
+    throw std::runtime_error("Failed to open snapshot SHM " + normalized_name +
+                             ": " + std::strerror(errno));
+  }
+  struct stat statbuf;
+  if (::fstat(fd, &statbuf) != 0) {
+    const int saved_errno = errno;
+    ::close(fd);
+    throw std::runtime_error("Failed to stat snapshot SHM " + normalized_name +
+                             ": " + std::strerror(saved_errno));
+  }
+  if (statbuf.st_size < static_cast<off_t>(kSnapshotShmHeaderSize)) {
+    ::close(fd);
+    throw std::runtime_error("Snapshot SHM region is smaller than header");
+  }
+  if (expected_size_bytes > 0 &&
+      static_cast<size_t>(statbuf.st_size) < expected_size_bytes) {
+    ::close(fd);
+    throw std::runtime_error("Snapshot SHM region is smaller than expected");
+  }
+  void* mapped = ::mmap(nullptr, static_cast<size_t>(statbuf.st_size), PROT_READ,
+                        MAP_SHARED, fd, 0);
+  if (mapped == MAP_FAILED) {
+    const int saved_errno = errno;
+    ::close(fd);
+    throw std::runtime_error("Failed to mmap snapshot SHM " + normalized_name +
+                             ": " + std::strerror(saved_errno));
+  }
+
+  SnapshotShmMapping mapping;
+  mapping.fd = fd;
+  mapping.size = static_cast<size_t>(statbuf.st_size);
+  mapping.ptr = static_cast<char*>(mapped);
+  return mapping;
+}
+
 static py::dict MetadataToPyDict(
     const SimulationMetadataNative& metadata) {
   py::dict dict;
@@ -694,6 +969,58 @@ static py::dict MetadataToPyDict(
   dict["total_decode_tokens"] = metadata.total_decode_tokens;
   dict["estimated_wait_ms"] = metadata.estimated_wait_ms;
   return dict;
+}
+
+static SimulationStopModeNative ParseStopMode(
+    std::optional<std::string> stop_mode,
+    SimulationStopModeNative default_mode) {
+  if (!stop_mode.has_value()) {
+    return default_mode;
+  }
+  std::string normalized = *stop_mode;
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  if (normalized == "drain") {
+    return SimulationStopModeNative::kDrain;
+  }
+  if (normalized == "first_schedule") {
+    return SimulationStopModeNative::kFirstSchedule;
+  }
+  if (normalized == "prefill_done") {
+    return SimulationStopModeNative::kPrefillDone;
+  }
+  throw std::runtime_error("Unknown simulation stop mode: " + *stop_mode);
+}
+
+static SchedulerStateSnapshotNative BuildProbeSnapshotNative(
+    const SchedulerStateSnapshotNative& snapshot,
+    int64_t prompt_tokens) {
+  SchedulerStateSnapshotNative probe_snapshot = snapshot;
+  RequestStateSnapshotNative probe_request;
+  probe_request.request_id = kProbeRequestId;
+  probe_request.status = "WAITING";
+  probe_request.priority = 0;
+  double max_arrival = 0.0;
+  for (const auto& entry : snapshot.requests) {
+    max_arrival = std::max(max_arrival, entry.second.arrival_time);
+  }
+  probe_request.arrival_time = max_arrival + 1.0;
+  probe_request.num_prompt_tokens = std::max<int64_t>(0, prompt_tokens);
+  probe_request.num_computed_tokens = 0;
+  probe_request.num_output_target_tokens = 1;
+  probe_request.num_prompt_processed_tokens = 0;
+  probe_request.num_output_processed_tokens = 0;
+  probe_request.max_tokens = 1;
+  probe_request.num_preemptions = 0;
+  probe_request.num_cached_tokens = 0;
+  probe_request.is_long_prompt = false;
+  probe_request.kv_block_counts.assign(
+      snapshot.kv_cache_config.kv_cache_groups.size(), 0);
+
+  probe_snapshot.requests[kProbeRequestId] = probe_request;
+  probe_snapshot.waiting_request_ids.push_back(kProbeRequestId);
+  probe_snapshot.num_waiting += 1;
+  return probe_snapshot;
 }
 
 template <typename Container>
@@ -1076,25 +1403,28 @@ static SimulationMetadataNative RunSimulationNative(
     double decode_coeff,
     double sum_coeff,
     double sum_sq_coeff,
-    std::optional<int64_t> dummy_prompt_tokens_override = std::nullopt) {
-  SimulationContext state(snapshot, dummy_prompt_tokens_override);
+    std::optional<int64_t> prompt_tokens_override = std::nullopt,
+    SimulationStopModeNative stop_mode = SimulationStopModeNative::kDrain) {
+  SchedulerStateSnapshotNative simulation_snapshot = snapshot;
+  std::optional<std::string> probe_request_id = std::nullopt;
+  if (prompt_tokens_override.has_value()) {
+    simulation_snapshot =
+        BuildProbeSnapshotNative(snapshot, *prompt_tokens_override);
+    probe_request_id = std::string(kProbeRequestId);
+  }
+  SimulationContext state(simulation_snapshot, probe_request_id);
+  SimRequestState* probe_request =
+      probe_request_id.has_value() ? state.get_request(*probe_request_id) : nullptr;
   int idle_ticks = 0;
   const int max_idle_ticks = 4;
 
   while (true) {
     auto batch = BuildNextBatch(state);
-    bool contains_dummy = false;
-    for (SimRequestState* req : batch.batch_requests) {
-      if (req && req->request_id() == "__DUMMY__") {
-        contains_dummy = true;
+    if (batch.batch_requests.empty()) {
+      if (stop_mode == SimulationStopModeNative::kDrain &&
+          state.running().empty() && state.waiting().empty()) {
         break;
       }
-    }
-    if (contains_dummy) {
-      break;
-    }
-
-    if (batch.batch_requests.empty()) {
       idle_ticks += 1;
       if (idle_ticks >= max_idle_ticks) {
         throw std::runtime_error(
@@ -1105,6 +1435,18 @@ static SimulationMetadataNative RunSimulationNative(
     idle_ticks = 0;
 
     double start_time = state.current_time_ms();
+    bool contains_probe = false;
+    for (SimRequestState* req : batch.batch_requests) {
+      if (req != nullptr) {
+        req->mark_scheduled(start_time);
+        contains_probe = contains_probe || req == probe_request;
+      }
+    }
+    if (contains_probe &&
+        stop_mode == SimulationStopModeNative::kFirstSchedule) {
+      break;
+    }
+
     auto apply_result =
         ApplyBatchResultNative(state, batch.batch_requests, batch.batch_tokens);
     double batch_time = EstimateBatchTime(
@@ -1114,6 +1456,9 @@ static SimulationMetadataNative RunSimulationNative(
         sum_sq_coeff);
     double end_time = start_time + batch_time;
 
+    for (SimRequestState* req : apply_result.prefill_done) {
+      req->mark_prefill_done(end_time);
+    }
     for (SimRequestState* req : apply_result.finished) {
       req->mark_finished(end_time);
     }
@@ -1122,19 +1467,36 @@ static SimulationMetadataNative RunSimulationNative(
     state.total_decode_tokens() += apply_result.total_decode;
     state.current_time_ms() = end_time;
     state.num_batches() += 1;
+    if (probe_request != nullptr &&
+        stop_mode == SimulationStopModeNative::kPrefillDone &&
+        probe_request->prefill_done_time_ms().has_value()) {
+      break;
+    }
+    if (stop_mode == SimulationStopModeNative::kDrain &&
+        state.running().empty() && state.waiting().empty()) {
+      break;
+    }
   }
 
   SimulationMetadataNative metadata;
   metadata.num_batches = state.num_batches_value();
-  metadata.num_running =
-      static_cast<int64_t>(state.running().size());
-  metadata.num_waiting =
-      static_cast<int64_t>(state.waiting().size());
+  metadata.num_running = state.visible_running_size();
+  metadata.num_waiting = state.visible_waiting_size();
   metadata.running_at_snapshot = state.running_at_snapshot();
   metadata.queued_at_snapshot = state.queued_at_snapshot();
   metadata.total_prefill_tokens = state.total_prefill_tokens_value();
   metadata.total_decode_tokens = state.total_decode_tokens_value();
-  metadata.estimated_wait_ms = state.current_time_ms();
+  if (probe_request != nullptr) {
+    if (stop_mode == SimulationStopModeNative::kFirstSchedule) {
+      metadata.estimated_wait_ms =
+          probe_request->first_scheduled_time_ms().value_or(0.0);
+    } else {
+      metadata.estimated_wait_ms =
+          probe_request->prefill_done_time_ms().value_or(state.current_time_ms());
+    }
+  } else {
+    metadata.estimated_wait_ms = state.current_time_ms();
+  }
   return metadata;
 }
 
@@ -1559,61 +1921,89 @@ class SchedulerSimulationWorkerStub {
         prefill_sq_coeff_(prefill_sq_coeff),
         sum_sq_coeff_(sum_sq_coeff) {}
 
-  ~SchedulerSimulationWorkerStub() { StopThread(); }
+  ~SchedulerSimulationWorkerStub() { StopAllThreads(); }
 
   void start() { StartThread(); }
-  void stop() { StopThread(); }
+  void stop() { StopAllThreads(); }
 
   void update_snapshot(py::bytes snapshot_bytes) {
-    latest_snapshot_bytes_ = snapshot_bytes;
-    MsgpackParser parser(latest_snapshot_bytes_.data(),
-                         latest_snapshot_bytes_.size());
+    std::string latest_snapshot_bytes = snapshot_bytes;
+    MsgpackParser parser(latest_snapshot_bytes.data(),
+                         latest_snapshot_bytes.size());
     auto parsed_snapshot =
         std::make_shared<SchedulerStateSnapshotNative>(
             ParseSchedulerSnapshot(parser.parse()));
-    has_snapshot_ = true;
+    PublishParsedSnapshot(parsed_snapshot, std::move(latest_snapshot_bytes));
+  }
 
-    PendingInfo info;
-    info.version = parsed_snapshot->version;
-    info.snapshot_timestamp = parsed_snapshot->created_at;
-    info.num_requests =
-        static_cast<int64_t>(parsed_snapshot->requests.size());
-    info.build_latency_ms = parsed_snapshot->build_latency_ms;
-
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      parsed_snapshot_ = parsed_snapshot;
-      pending_snapshot_ = parsed_snapshot;
-      pending_info_ = info;
-    }
-    cv_.notify_all();
+  void start_snapshot_shm_watcher(const std::string& shm_name,
+                                  int64_t expected_size_bytes = 0,
+                                  int64_t poll_interval_ms =
+                                      kDefaultSnapshotWatcherPollIntervalMs) {
+    StartSnapshotWatcher(shm_name, expected_size_bytes, poll_interval_ms);
   }
 
   py::object latest_result() const { return latest_result_summary(); }
 
   py::object latest_snapshot() const {
-    if (!has_snapshot_) {
+    std::string snapshot_bytes;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!has_snapshot_) {
+        return py::none();
+      }
+      snapshot_bytes = latest_snapshot_bytes_;
+    }
+    if (snapshot_bytes.empty()) {
       return py::none();
     }
-    return py::bytes(latest_snapshot_bytes_);
+    return py::bytes(snapshot_bytes);
   }
 
   py::object parsed_snapshot() const {
-    if (!parsed_snapshot_) {
+    std::shared_ptr<const SchedulerStateSnapshotNative> snapshot;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot = parsed_snapshot_;
+    }
+    if (!snapshot) {
       return py::none();
     }
-    return ToPyDict(*parsed_snapshot_);
+    return ToPyDict(*snapshot);
   }
 
-  py::dict run_simulation_for_test(py::bytes snapshot_bytes) const {
+  py::object latest_parsed_snapshot_summary() const {
+    std::shared_ptr<const SchedulerStateSnapshotNative> snapshot;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot = parsed_snapshot_;
+    }
+    if (!snapshot) {
+      return py::none();
+    }
+    return py::make_tuple(snapshot->version, snapshot->created_at,
+                          static_cast<int64_t>(snapshot->requests.size()),
+                          snapshot->build_latency_ms);
+  }
+
+  py::dict run_simulation_for_test(
+      py::bytes snapshot_bytes,
+      std::optional<int64_t> prompt_tokens = std::nullopt,
+      std::optional<std::string> stop_mode = std::nullopt) const {
     std::string buffer = snapshot_bytes;
     MsgpackParser parser(buffer.data(), buffer.size());
     auto snapshot = ParseSchedulerSnapshot(parser.parse());
     try {
+      auto parsed_stop_mode = ParseStopMode(
+          stop_mode,
+          prompt_tokens.has_value()
+              ? SimulationStopModeNative::kPrefillDone
+              : SimulationStopModeNative::kDrain);
       auto metadata = RunSimulationNative(snapshot, intercept_,
                                           prefill_coeff_, prefill_sq_coeff_,
                                           decode_coeff_, sum_coeff_,
-                                          sum_sq_coeff_);
+                                          sum_sq_coeff_, prompt_tokens,
+                                          parsed_stop_mode);
       return MetadataToPyDict(metadata);
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string("Scheduler simulation failed: ") +
@@ -1624,7 +2014,9 @@ class SchedulerSimulationWorkerStub {
     }
   }
 
-  py::object run_simulation_on_latest_snapshot(int64_t prompt_tokens) const {
+  py::object run_simulation_on_latest_snapshot(
+      int64_t prompt_tokens,
+      std::optional<std::string> stop_mode = std::nullopt) const {
     if (prompt_tokens < 0) {
       throw std::runtime_error("prompt_tokens must be >= 0");
     }
@@ -1644,10 +2036,12 @@ class SchedulerSimulationWorkerStub {
 
     SimulationMetadataNative metadata;
     try {
+      auto parsed_stop_mode = ParseStopMode(
+          stop_mode, SimulationStopModeNative::kPrefillDone);
       metadata =
           RunSimulationNative(*snapshot, intercept_, prefill_coeff_,
                               prefill_sq_coeff_, decode_coeff_, sum_coeff_,
-                              sum_sq_coeff_, prompt_tokens);
+                              sum_sq_coeff_, prompt_tokens, parsed_stop_mode);
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string("Scheduler simulation failed: ") +
                                e.what());
@@ -1668,10 +2062,10 @@ class SchedulerSimulationWorkerStub {
   }
 
   void clear_latest_snapshot() {
+    std::lock_guard<std::mutex> lock(mutex_);
     latest_snapshot_bytes_.clear();
     has_snapshot_ = false;
     parsed_snapshot_.reset();
-    std::lock_guard<std::mutex> lock(mutex_);
     pending_snapshot_.reset();
     pending_info_.reset();
   }
@@ -1700,6 +2094,31 @@ class SchedulerSimulationWorkerStub {
     double build_latency_ms = 0.0;
   };
 
+  static PendingInfo BuildPendingInfo(
+      const SchedulerStateSnapshotNative& snapshot) {
+    PendingInfo info;
+    info.version = snapshot.version;
+    info.snapshot_timestamp = snapshot.created_at;
+    info.num_requests = static_cast<int64_t>(snapshot.requests.size());
+    info.build_latency_ms = snapshot.build_latency_ms;
+    return info;
+  }
+
+  void PublishParsedSnapshot(
+      std::shared_ptr<const SchedulerStateSnapshotNative> parsed_snapshot,
+      std::string latest_snapshot_bytes) {
+    PendingInfo info = BuildPendingInfo(*parsed_snapshot);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_snapshot_bytes_ = std::move(latest_snapshot_bytes);
+      has_snapshot_ = true;
+      parsed_snapshot_ = std::move(parsed_snapshot);
+      pending_snapshot_ = parsed_snapshot_;
+      pending_info_ = info;
+    }
+    cv_.notify_all();
+  }
+
   void StartThread() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (worker_started_) {
@@ -1711,7 +2130,7 @@ class SchedulerSimulationWorkerStub {
     worker_started_ = true;
   }
 
-  void StopThread() {
+  void StopSimulationThread() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!worker_started_) {
@@ -1723,7 +2142,186 @@ class SchedulerSimulationWorkerStub {
     if (worker_thread_.joinable()) {
       worker_thread_.join();
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     worker_started_ = false;
+    stop_flag_ = false;
+  }
+
+  void StartSnapshotWatcher(const std::string& shm_name,
+                           int64_t expected_size_bytes,
+                           int64_t poll_interval_ms) {
+    const int64_t normalized_expected_size =
+        std::max<int64_t>(0, expected_size_bytes);
+    const int64_t normalized_poll_interval =
+        std::max<int64_t>(1, poll_interval_ms);
+    const std::string normalized_name = NormalizeSnapshotShmName(shm_name);
+
+    bool restart_required = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (watcher_started_) {
+        restart_required =
+            watcher_shm_name_ != normalized_name ||
+            watcher_expected_size_bytes_ !=
+                static_cast<size_t>(normalized_expected_size) ||
+            watcher_poll_interval_ms_ != normalized_poll_interval;
+        if (!restart_required) {
+          return;
+        }
+      }
+    }
+    if (restart_required) {
+      StopSnapshotWatcher();
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      watcher_stop_flag_ = false;
+      watcher_shm_name_ = normalized_name;
+      watcher_expected_size_bytes_ =
+          static_cast<size_t>(normalized_expected_size);
+      watcher_poll_interval_ms_ = normalized_poll_interval;
+      watcher_thread_ = std::thread(
+          &SchedulerSimulationWorkerStub::RunSnapshotWatcherLoop, this);
+      watcher_started_ = true;
+    }
+  }
+
+  void StopSnapshotWatcher() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!watcher_started_) {
+        return;
+      }
+      watcher_stop_flag_ = true;
+    }
+    cv_.notify_all();
+    if (watcher_thread_.joinable()) {
+      watcher_thread_.join();
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    watcher_started_ = false;
+    watcher_stop_flag_ = false;
+    watcher_shm_name_.clear();
+    watcher_expected_size_bytes_ = 0;
+    watcher_poll_interval_ms_ = kDefaultSnapshotWatcherPollIntervalMs;
+  }
+
+  void StopAllThreads() {
+    StopSnapshotWatcher();
+    StopSimulationThread();
+  }
+
+  bool WaitForWatcherPollInterval(int64_t poll_interval_ms) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(
+        lock, std::chrono::milliseconds(std::max<int64_t>(1, poll_interval_ms)),
+        [&] { return watcher_stop_flag_; });
+  }
+
+  void RunSnapshotWatcherLoop() {
+    std::optional<SnapshotShmMapping> mapping;
+    uint64_t last_parsed_version = 0;
+    bool has_parsed_version = false;
+    while (true) {
+      std::string shm_name;
+      size_t expected_size_bytes = 0;
+      int64_t poll_interval_ms = kDefaultSnapshotWatcherPollIntervalMs;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (watcher_stop_flag_) {
+          break;
+        }
+        shm_name = watcher_shm_name_;
+        expected_size_bytes = watcher_expected_size_bytes_;
+        poll_interval_ms = watcher_poll_interval_ms_;
+      }
+
+      try {
+        if (!mapping) {
+          mapping = TryOpenSnapshotShmMapping(shm_name, expected_size_bytes);
+          if (!mapping.has_value()) {
+            if (WaitForWatcherPollInterval(poll_interval_ms)) {
+              break;
+            }
+            continue;
+          }
+          has_parsed_version = false;
+          last_parsed_version = 0;
+        }
+
+        std::optional<SnapshotShmHeaderNative> latest_header =
+            ReadSnapshotHeaderFromMappedShm(mapping->ptr, mapping->size);
+        if (!latest_header.has_value()) {
+          if (WaitForWatcherPollInterval(poll_interval_ms)) {
+            break;
+          }
+          continue;
+        }
+        if (latest_header->snapshot_version == 0) {
+          if (WaitForWatcherPollInterval(poll_interval_ms)) {
+            break;
+          }
+          continue;
+        }
+
+        if (has_parsed_version &&
+            latest_header->snapshot_version == last_parsed_version) {
+          if (WaitForWatcherPollInterval(poll_interval_ms)) {
+            break;
+          }
+          continue;
+        }
+
+        SnapshotShmHeaderNative header;
+        std::optional<std::string> payload = ReadSnapshotPayloadFromMappedShm(
+            mapping->ptr, mapping->size, &header);
+        if (!payload.has_value()) {
+          if (WaitForWatcherPollInterval(poll_interval_ms)) {
+            break;
+          }
+          continue;
+        }
+        if (header.snapshot_version == 0 || payload->empty()) {
+          if (WaitForWatcherPollInterval(poll_interval_ms)) {
+            break;
+          }
+          continue;
+        }
+        if (has_parsed_version && header.snapshot_version == last_parsed_version) {
+          if (WaitForWatcherPollInterval(poll_interval_ms)) {
+            break;
+          }
+          continue;
+        }
+
+        MsgpackParser parser(payload->data(), payload->size());
+        auto parsed_snapshot =
+            std::make_shared<SchedulerStateSnapshotNative>(
+                ParseSchedulerSnapshot(parser.parse()));
+        PublishParsedSnapshot(parsed_snapshot, std::move(*payload));
+        last_parsed_version = header.snapshot_version;
+        has_parsed_version = true;
+        continue;
+      } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "[scheduler_sim] Snapshot watcher failed for %s: %s\n",
+                     shm_name.c_str(), e.what());
+        std::fflush(stderr);
+        mapping.reset();
+      } catch (...) {
+        std::fprintf(
+            stderr,
+            "[scheduler_sim] Snapshot watcher failed for %s with an unknown error\n",
+            shm_name.c_str());
+        std::fflush(stderr);
+        mapping.reset();
+      }
+
+      if (WaitForWatcherPollInterval(poll_interval_ms)) {
+        break;
+      }
+    }
   }
 
   void RunLoop() {
@@ -1801,14 +2399,20 @@ class SchedulerSimulationWorkerStub {
   double sum_coeff_;
   double prefill_sq_coeff_;
   double sum_sq_coeff_;
+  mutable std::mutex mutex_;
+  std::condition_variable cv_;
   bool has_snapshot_ = false;
   std::string latest_snapshot_bytes_;
   std::shared_ptr<const SchedulerStateSnapshotNative> parsed_snapshot_;
-  mutable std::mutex mutex_;
-  std::condition_variable cv_;
   bool stop_flag_ = false;
   bool worker_started_ = false;
   std::thread worker_thread_;
+  bool watcher_stop_flag_ = false;
+  bool watcher_started_ = false;
+  std::thread watcher_thread_;
+  std::string watcher_shm_name_;
+  size_t watcher_expected_size_bytes_ = 0;
+  int64_t watcher_poll_interval_ms_ = kDefaultSnapshotWatcherPollIntervalMs;
   std::shared_ptr<const SchedulerStateSnapshotNative> pending_snapshot_;
   std::optional<PendingInfo> pending_info_;
   std::optional<SimulationOutcome> latest_outcome_;
@@ -1832,20 +2436,32 @@ PYBIND11_MODULE(_scheduler_sim, m) {
       .def("update_snapshot",
            &vllm::scheduler_sim::SchedulerSimulationWorkerStub::update_snapshot,
            py::arg("snapshot_bytes"))
+      .def("start_snapshot_shm_watcher",
+           &vllm::scheduler_sim::SchedulerSimulationWorkerStub::
+               start_snapshot_shm_watcher,
+           py::arg("shm_name"),
+           py::arg("expected_size_bytes") = 0,
+           py::arg("poll_interval_ms") = 1)
       .def("latest_result",
            &vllm::scheduler_sim::SchedulerSimulationWorkerStub::latest_result)
       .def("latest_snapshot",
            &vllm::scheduler_sim::SchedulerSimulationWorkerStub::latest_snapshot)
       .def("parsed_snapshot",
            &vllm::scheduler_sim::SchedulerSimulationWorkerStub::parsed_snapshot)
+      .def("latest_parsed_snapshot_summary",
+           &vllm::scheduler_sim::SchedulerSimulationWorkerStub::
+               latest_parsed_snapshot_summary)
       .def("run_simulation_for_test",
            &vllm::scheduler_sim::SchedulerSimulationWorkerStub::
                run_simulation_for_test,
-           py::arg("snapshot_bytes"))
+           py::arg("snapshot_bytes"),
+           py::arg("prompt_tokens") = py::none(),
+           py::arg("stop_mode") = py::none())
       .def("run_simulation_on_latest_snapshot",
            &vllm::scheduler_sim::SchedulerSimulationWorkerStub::
                run_simulation_on_latest_snapshot,
-           py::arg("prompt_tokens"))
+           py::arg("prompt_tokens"),
+           py::arg("stop_mode") = py::none())
       .def("latest_result_summary",
            &vllm::scheduler_sim::SchedulerSimulationWorkerStub::
                latest_result_summary)

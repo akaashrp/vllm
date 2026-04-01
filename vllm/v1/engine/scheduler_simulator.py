@@ -12,7 +12,8 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple, Type
+from enum import Enum
+from typing import Any, Deque, Dict, List, Optional, Tuple, Type, cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.state_snapshot import (
@@ -54,6 +55,8 @@ Speculative decoding would require estimating draft model time per speculative d
 
 logger = init_logger(__name__)
 
+PROBE_REQUEST_ID = "__PROBE__"
+
 try:
     from vllm.v1.engine import _scheduler_sim as _scheduler_sim_native
 except ImportError:
@@ -67,6 +70,29 @@ Problems:
 
 Note: including LoRAs seems relatively trivial
 """
+
+
+class SimulationStopMode(str, Enum):
+    DRAIN = "drain"
+    FIRST_SCHEDULE = "first_schedule"
+    PREFILL_DONE = "prefill_done"
+
+    @classmethod
+    def from_value(
+        cls,
+        value: Optional["SimulationStopMode | str"],
+        *,
+        default: "SimulationStopMode",
+    ) -> "SimulationStopMode":
+        if value is None:
+            return default
+        if isinstance(value, cls):
+            return value
+        normalized = str(value).strip().lower()
+        for mode in cls:
+            if mode.value == normalized:
+                return mode
+        raise ValueError(f"Unknown simulation stop mode: {value!r}")
 
 
 class SimulationProfiler:
@@ -156,6 +182,73 @@ def _snapshot_backlog_summary(snapshot: SchedulerStateSnapshot) -> dict[str, int
             snapshot.running_context_length_sq_sum_snapshot
         ),
     }
+
+
+def _build_probe_snapshot(
+    snapshot: SchedulerStateSnapshot,
+    *,
+    prompt_tokens: int,
+) -> SchedulerStateSnapshot:
+    probe = RequestStateSnapshot(
+        request_id=PROBE_REQUEST_ID,
+        status="WAITING",
+        priority=0,
+        arrival_time=float(
+            max(
+                [request.arrival_time for request in snapshot.requests.values()],
+                default=0.0,
+            )
+            + 1.0
+        ),
+        num_prompt_tokens=max(int(prompt_tokens), 0),
+        num_computed_tokens=0,
+        num_output_target_tokens=1,
+        num_prompt_processed_tokens=0,
+        num_output_processed_tokens=0,
+        max_tokens=1,
+        num_preemptions=0,
+        num_cached_tokens=0,
+        is_long_prompt=False,
+        kv_block_counts=tuple(
+            0 for _ in snapshot.kv_cache_config.kv_cache_groups
+        ),
+    )
+    requests = dict(snapshot.requests)
+    requests[PROBE_REQUEST_ID] = probe
+    return SchedulerStateSnapshot(
+        version=snapshot.version,
+        created_at=snapshot.created_at,
+        num_running=snapshot.num_running,
+        num_waiting=snapshot.num_waiting + 1,
+        running_request_ids=list(snapshot.running_request_ids),
+        waiting_request_ids=list(snapshot.waiting_request_ids) + [PROBE_REQUEST_ID],
+        requests=requests,
+        config=snapshot.config,
+        kv_cache_config=snapshot.kv_cache_config,
+        parallel_config=snapshot.parallel_config,
+        resident_set_size=snapshot.resident_set_size,
+        waiting_set_size=snapshot.waiting_set_size,
+        prefill_backlog_running_tokens=snapshot.prefill_backlog_running_tokens,
+        prefill_backlog_running_sq_sum_tokens=(
+            snapshot.prefill_backlog_running_sq_sum_tokens
+        ),
+        prefill_backlog_waiting_tokens=snapshot.prefill_backlog_waiting_tokens,
+        prefill_backlog_waiting_sq_sum_tokens=(
+            snapshot.prefill_backlog_waiting_sq_sum_tokens
+        ),
+        prefill_backlog_total_tokens=snapshot.prefill_backlog_total_tokens,
+        prefill_backlog_total_sq_sum_tokens=(
+            snapshot.prefill_backlog_total_sq_sum_tokens
+        ),
+        decode_backlog_total_tokens=snapshot.decode_backlog_total_tokens,
+        running_context_length_sum_snapshot=(
+            snapshot.running_context_length_sum_snapshot
+        ),
+        running_context_length_sq_sum_snapshot=(
+            snapshot.running_context_length_sq_sum_snapshot
+        ),
+        build_latency_ms=snapshot.build_latency_ms,
+    )
 
 
 @dataclass
@@ -315,17 +408,25 @@ class SimulationContext:
     num_batches: int = 0
     queued_at_snapshot: int = 0
     running_at_snapshot: int = 0
+    probe_request_id: Optional[str] = None
 
-    def __init__(self, snapshot: SchedulerStateSnapshot) -> None:
+    def __init__(
+        self,
+        snapshot: SchedulerStateSnapshot,
+        *,
+        probe_request_id: Optional[str] = None,
+    ) -> None:
         self.snapshot = snapshot
+        self.probe_request_id = probe_request_id
         self.requests = {
             request_id: SimRequestState(req) for request_id, req in snapshot.requests.items()
         }
         self.running = self._build_running()
         self.waiting = self._build_waiting()
         self.running_at_snapshot = len(snapshot.running_request_ids)
-        # exclude dummy request for snapshot count
-        self.queued_at_snapshot = max(len(snapshot.waiting_request_ids) - 1, 0)
+        self.queued_at_snapshot = len(snapshot.waiting_request_ids)
+        if probe_request_id is not None and probe_request_id in snapshot.waiting_request_ids:
+            self.queued_at_snapshot = max(self.queued_at_snapshot - 1, 0)
         self.kv_allocations = self._init_kv_allocations()
         self.kv_free_blocks = snapshot.kv_cache_config.kv_cache_free_blocks
         self.current_time_ms = 0.0
@@ -334,45 +435,25 @@ class SimulationContext:
         self.num_batches = 0
 
     def summary_metadata(self) -> dict:
-        # Aggregate backlog/state fields only; keep payload compact by default.
-        non_dummy_running = [req for req in self.running if req.request_id != "__DUMMY__"]
-        non_dummy_waiting = [req for req in self.waiting if req.request_id != "__DUMMY__"]
-        prefill_backlog_running = sum(req.prefill_remaining for req in non_dummy_running)
-        prefill_backlog_running_sq_sum = sum(
-            req.prefill_remaining * req.prefill_remaining for req in non_dummy_running
-        )
-        prefill_backlog_waiting = sum(req.prefill_remaining for req in non_dummy_waiting)
-        prefill_backlog_waiting_sq_sum = sum(
-            req.prefill_remaining * req.prefill_remaining for req in non_dummy_waiting
-        )
-        decode_backlog_total = sum(req.decode_remaining for req in non_dummy_running) + sum(
-            req.decode_remaining for req in non_dummy_waiting
-        )
+        def _is_visible(req: SimRequestState) -> bool:
+            return req.request_id != self.probe_request_id
+
+        visible_running = [req for req in self.running if _is_visible(req)]
+        visible_waiting = [req for req in self.waiting if _is_visible(req)]
         return {
             "num_batches": self.num_batches,
-            "num_running": len(self.running),
-            "num_waiting": len(self.waiting),
+            "num_running": len(visible_running),
+            "num_waiting": len(visible_waiting),
             "running_at_snapshot": self.running_at_snapshot,
             "queued_at_snapshot": self.queued_at_snapshot,
             "total_prefill_tokens": self.total_prefill_tokens,
             "total_decode_tokens": self.total_decode_tokens,
-            "resident_set_size": len(non_dummy_running),
-            "waiting_set_size": len(non_dummy_waiting),
-            "prefill_backlog_running_tokens": int(prefill_backlog_running),
-            "prefill_backlog_running_sq_sum_tokens": int(prefill_backlog_running_sq_sum),
-            "prefill_backlog_waiting_tokens": int(prefill_backlog_waiting),
-            "prefill_backlog_waiting_sq_sum_tokens": int(prefill_backlog_waiting_sq_sum),
-            "prefill_backlog_total_tokens": int(
-                prefill_backlog_running + prefill_backlog_waiting
-            ),
-            "prefill_backlog_total_sq_sum_tokens": int(
-                prefill_backlog_running_sq_sum + prefill_backlog_waiting_sq_sum
-            ),
-            "decode_backlog_total_tokens": int(decode_backlog_total),
         }
 
     def estimate_wait_time_ms(self, request_id: Optional[str] = None) -> float:
-        target_id = request_id or "__DUMMY__"
+        target_id = request_id or self.probe_request_id
+        if target_id is None:
+            return 0.0
         req = self.requests.get(target_id)
         if req and req.first_scheduled_time_ms is not None:
             return req.first_scheduled_time_ms
@@ -958,9 +1039,45 @@ class PythonSchedulerSimulationWorker:
             + (sum_sq_coeff * sum_sq_tokens)
         ) * 1000.0
 
-    def _run_simulation(self, snapshot: SchedulerStateSnapshot) -> SimulationResult:
+    def _run_simulation(
+        self,
+        snapshot: SchedulerStateSnapshot,
+        *,
+        prompt_tokens: Optional[int] = None,
+        stop_mode: Optional[SimulationStopMode | str] = None,
+    ) -> SimulationResult:
         simulation_timestamp = time.monotonic()
-        state = SimulationContext(snapshot)
+        if prompt_tokens is None:
+            resolved_stop_mode = SimulationStopMode.from_value(
+                stop_mode,
+                default=SimulationStopMode.DRAIN,
+            )
+            if resolved_stop_mode is not SimulationStopMode.DRAIN:
+                raise ValueError(
+                    "prompt_tokens must be provided for critical-path stop modes"
+                )
+            simulation_snapshot = snapshot
+            probe_request_id = None
+        else:
+            resolved_stop_mode = SimulationStopMode.from_value(
+                stop_mode,
+                default=SimulationStopMode.PREFILL_DONE,
+            )
+            simulation_snapshot = _build_probe_snapshot(
+                snapshot,
+                prompt_tokens=int(prompt_tokens),
+            )
+            probe_request_id = PROBE_REQUEST_ID
+
+        state = SimulationContext(
+            simulation_snapshot,
+            probe_request_id=probe_request_id,
+        )
+        probe_request = (
+            state.requests.get(probe_request_id)
+            if probe_request_id is not None
+            else None
+        )
 
         idle_ticks = 0
         max_idle_ticks = 4
@@ -971,10 +1088,12 @@ class PythonSchedulerSimulationWorker:
                 sum_context_length,
                 sum_sq_tokens,
             ) = self._build_next_batch(state)
-            if any(req.request_id == "__DUMMY__" for req in batch_requests):
-                break
-            
             if not batch_requests:
+                if (
+                    resolved_stop_mode is SimulationStopMode.DRAIN
+                    and not state.has_pending_requests()
+                ):
+                    break
                 idle_ticks += 1
                 if idle_ticks >= max_idle_ticks:
                     raise RuntimeError("Simulation stalled: no requests can be scheduled")
@@ -982,11 +1101,21 @@ class PythonSchedulerSimulationWorker:
             idle_ticks = 0
 
             start_time = state.current_time_ms
+            contains_probe = False
+            for req in batch_requests:
+                req.mark_scheduled(start_time)
+                contains_probe = contains_probe or req is probe_request
+            if (
+                contains_probe
+                and resolved_stop_mode is SimulationStopMode.FIRST_SCHEDULE
+            ):
+                break
+
             (
                 batch_prefill,
                 batch_prefill_sq_sum,
                 batch_decode,
-                _,
+                prefill_done_reqs,
                 finished_reqs,
             ) = self._apply_batch_result(state, batch_requests, batch_tokens)
             batch_time = self._estimate_batch_time(
@@ -1003,17 +1132,40 @@ class PythonSchedulerSimulationWorker:
                 self._sum_sq_coeff,
             )
             end_time = start_time + batch_time
-            
+
+            for req in prefill_done_reqs:
+                req.mark_prefill_done(end_time)
             for req in finished_reqs:
                 req.mark_finished(end_time)
-            
+
             state.total_prefill_tokens += batch_prefill
             state.total_decode_tokens += batch_decode
             state.current_time_ms = end_time
             state.num_batches += 1
+            if (
+                probe_request is not None
+                and resolved_stop_mode is SimulationStopMode.PREFILL_DONE
+                and probe_request.prefill_done_time_ms is not None
+            ):
+                break
+            if (
+                resolved_stop_mode is SimulationStopMode.DRAIN
+                and not state.has_pending_requests()
+            ):
+                break
 
         metadata = state.summary_metadata()
-        metadata["estimated_wait_ms"] = state.current_time_ms
+        if probe_request is not None:
+            if resolved_stop_mode is SimulationStopMode.FIRST_SCHEDULE:
+                metadata["estimated_wait_ms"] = float(
+                    probe_request.first_scheduled_time_ms or 0.0
+                )
+            else:
+                metadata["estimated_wait_ms"] = float(
+                    probe_request.prefill_done_time_ms or state.current_time_ms
+                )
+        else:
+            metadata["estimated_wait_ms"] = state.current_time_ms
         return SimulationResult(
             snapshot_version=snapshot.version,
             snapshot_timestamp=snapshot.created_at,
@@ -1021,6 +1173,34 @@ class PythonSchedulerSimulationWorker:
             num_requests=len(snapshot.requests),
             metadata=metadata,
         )
+
+    def run_simulation_on_latest_snapshot(
+        self,
+        prompt_tokens: int,
+        stop_mode: Optional[SimulationStopMode | str] = None,
+    ) -> Optional[SimulationResult]:
+        with self._lock:
+            snapshot = self._latest_snapshot
+        if snapshot is None:
+            return None
+        return self._run_simulation(
+            snapshot,
+            prompt_tokens=int(prompt_tokens),
+            stop_mode=stop_mode,
+        )
+
+    def run_simulation(
+        self,
+        snapshot: SchedulerStateSnapshot,
+        *,
+        prompt_tokens: Optional[int] = None,
+        stop_mode: Optional[SimulationStopMode | str] = None,
+    ) -> dict:
+        return self._run_simulation(
+            snapshot,
+            prompt_tokens=prompt_tokens,
+            stop_mode=stop_mode,
+        ).metadata
 
 
 class NativeSchedulerSimulationWorker:
@@ -1078,6 +1258,25 @@ class NativeSchedulerSimulationWorker:
         serialized = encode_scheduler_state_snapshot(snapshot)
         self._worker.update_snapshot(serialized)
 
+    def start_snapshot_shm_watcher(
+        self,
+        shm_name: str,
+        *,
+        expected_size_bytes: int = 0,
+        poll_interval_ms: int = 1,
+    ) -> None:
+        start_watcher = getattr(self._worker, "start_snapshot_shm_watcher", None)
+        if start_watcher is None:
+            raise RuntimeError(
+                "Native scheduler simulator extension does not support "
+                "snapshot SHM watcher mode."
+            )
+        start_watcher(
+            str(shm_name),
+            int(expected_size_bytes),
+            int(poll_interval_ms),
+        )
+
     def latest_result(self) -> Optional[SimulationResult]:
         summary = self._worker.latest_result_summary()
         return self._result_from_summary(summary)
@@ -1109,19 +1308,35 @@ class NativeSchedulerSimulationWorker:
     def run_simulation_on_latest_snapshot(
         self,
         prompt_tokens: int,
+        stop_mode: Optional[SimulationStopMode | str] = None,
     ) -> Optional[SimulationResult]:
         run_critical_path = getattr(
             self._worker, "run_simulation_on_latest_snapshot", None
         )
         if run_critical_path is None:
             return None
-        summary = run_critical_path(int(prompt_tokens))
+        mode = SimulationStopMode.from_value(
+            stop_mode,
+            default=SimulationStopMode.PREFILL_DONE,
+        )
+        summary = run_critical_path(int(prompt_tokens), mode.value)
         return self._result_from_summary(summary)
 
     def latest_snapshot_summary(self) -> Optional[dict[str, int]]:
         if self._latest_snapshot_summary is None:
             return None
         return dict(self._latest_snapshot_summary)
+
+    def latest_parsed_snapshot_summary(
+        self,
+    ) -> Optional[tuple[int, float, int, float]]:
+        summary = getattr(self._worker, "latest_parsed_snapshot_summary", None)
+        if summary is None:
+            return None
+        parsed_summary = summary()
+        if parsed_summary is None:
+            return None
+        return cast(tuple[int, float, int, float], parsed_summary)
 
     def latest_snapshot(self) -> Optional[dict]:
         snapshot_bytes = self._worker.latest_snapshot()
@@ -1136,9 +1351,31 @@ class NativeSchedulerSimulationWorker:
     def clear_latest_result(self) -> None:
         self._worker.clear_latest_result()
 
-    def run_simulation(self, snapshot: SchedulerStateSnapshot) -> dict:
+    def run_simulation(
+        self,
+        snapshot: SchedulerStateSnapshot,
+        *,
+        prompt_tokens: Optional[int] = None,
+        stop_mode: Optional[SimulationStopMode | str] = None,
+    ) -> dict:
         serialized = encode_scheduler_state_snapshot(snapshot)
-        return self._worker.run_simulation_for_test(serialized)
+        mode = (
+            None
+            if prompt_tokens is None and stop_mode is None
+            else SimulationStopMode.from_value(
+                stop_mode,
+                default=(
+                    SimulationStopMode.PREFILL_DONE
+                    if prompt_tokens is not None
+                    else SimulationStopMode.DRAIN
+                ),
+            ).value
+        )
+        return self._worker.run_simulation_for_test(
+            serialized,
+            prompt_tokens,
+            mode,
+        )
 
 
 SchedulerSimulationWorker: Type[Any]

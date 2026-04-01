@@ -818,6 +818,7 @@ class AsyncLLM(EngineClient):
         self,
         include_timings: bool = False,
         prompt_tokens: Optional[int] = None,
+        stop_mode: Optional[str] = None,
     ):
         if not hasattr(self.engine_core, "collective_rpc_async"):
             raise NotImplementedError(
@@ -825,7 +826,7 @@ class AsyncLLM(EngineClient):
             )
         return await self.engine_core.collective_rpc_async(
             "get_wait_time_report",
-            args=(include_timings, prompt_tokens),
+            args=(include_timings, prompt_tokens, stop_mode),
         )
 
     @property

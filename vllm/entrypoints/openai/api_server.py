@@ -406,6 +406,7 @@ async def wait_time_report(
     raw_request: Request,
     include_timings: bool = Query(False),
     prompt_tokens: Optional[int] = Query(default=None, ge=0),
+    stop_mode: Optional[str] = Query(default=None),
 ):
     """Expose the latest wait-time simulation report."""
 
@@ -420,6 +421,7 @@ async def wait_time_report(
         reports = await method(
             include_timings=include_timings,
             prompt_tokens=prompt_tokens,
+            stop_mode=stop_mode,
         )
     except NotImplementedError as exc:  # pragma: no cover
         raise HTTPException(

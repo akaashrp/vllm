@@ -44,6 +44,9 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as V1Scheduler
+from vllm.v1.core.sched.snapshot_serialization import (
+    encode_scheduler_state_snapshot,
+)
 from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
@@ -54,6 +57,10 @@ from vllm.v1.engine import (
     UtilityResult,
 )
 from vllm.v1.engine.scheduler_simulator import PythonSchedulerSimulationWorker, NativeSchedulerSimulationWorker, SchedulerSimulationWorker
+from vllm.v1.engine.snapshot_shm import (
+    DEFAULT_SNAPSHOT_SHM_SIZE_BYTES,
+    SnapshotShmPublisher,
+)
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
@@ -151,17 +158,21 @@ class EngineCore:
             log_stats=self.log_stats,
         )
         
-        self.scheduler_simulator: Optional[PythonSchedulerSimulationWorker | NativeSchedulerSimulationWorker] = None
+        self.scheduler_simulator: Optional[
+            PythonSchedulerSimulationWorker | NativeSchedulerSimulationWorker
+        ] = None
+        self.snapshot_shm_publisher: Optional[SnapshotShmPublisher] = None
+        self._snapshot_simulator_update_interval_s: Optional[float] = None
+        self._snapshot_shm_publish_interval_s: Optional[float] = None
+        self._next_snapshot_simulator_update_time = 0.0
+        self._next_snapshot_shm_publish_time = 0.0
         if vllm_config.scheduler_config.enable_wait_time_simulation:
             interval = (
                 vllm_config.scheduler_config.wait_time_simulation_interval_ms / 1000.0
             )
-            snapshot_interval = interval / 2
+            self._snapshot_simulator_update_interval_s = interval / 2
             self.scheduler_simulator = SchedulerSimulationWorker(
                 interval_s=interval,
-                # average_prompt_length=self.vllm_config.scheduler_config.average_prompt_length,
-                # average_output_length=self.vllm_config.scheduler_config.average_output_length,
-                # average_max_tokens=self.vllm_config.scheduler_config.average_max_tokens,
                 intercept=self.vllm_config.scheduler_config.simulation_intercept,
                 prefill_coeff=self.vllm_config.scheduler_config.simulation_prefill_coeff,
                 prefill_sq_coeff=self.vllm_config.scheduler_config.simulation_prefill_sq_coeff,
@@ -169,13 +180,34 @@ class EngineCore:
                 sum_coeff=self.vllm_config.scheduler_config.simulation_sum_coeff,
                 sum_sq_coeff=self.vllm_config.scheduler_config.simulation_sum_sq_coeff,
             )
-            self.scheduler.set_snapshot_consumer(
-                self.scheduler_simulator.update_snapshot, interval_s=snapshot_interval
-            )
             self.scheduler_simulator.start()
-        else:
+        scheduler_cfg = vllm_config.scheduler_config
+        if scheduler_cfg.enable_snapshot_shm_publishing:
+            publish_interval_ms = int(scheduler_cfg.snapshot_shm_publish_interval_ms)
+            self._snapshot_shm_publish_interval_s = publish_interval_ms / 1000.0
+            self.snapshot_shm_publisher = SnapshotShmPublisher(
+                name=str(scheduler_cfg.snapshot_shm_name),
+                size_bytes=int(
+                    scheduler_cfg.snapshot_shm_size_bytes
+                    or DEFAULT_SNAPSHOT_SHM_SIZE_BYTES
+                ),
+                simulation_intercept=scheduler_cfg.simulation_intercept,
+                simulation_prefill_coeff=scheduler_cfg.simulation_prefill_coeff,
+                simulation_prefill_sq_coeff=scheduler_cfg.simulation_prefill_sq_coeff,
+                simulation_decode_coeff=scheduler_cfg.simulation_decode_coeff,
+                simulation_sum_coeff=scheduler_cfg.simulation_sum_coeff,
+                simulation_sum_sq_coeff=scheduler_cfg.simulation_sum_sq_coeff,
+            )
+
+        consumer_interval_s = self._resolve_snapshot_consumer_interval_s()
+        if consumer_interval_s is None:
             self.scheduler.set_snapshot_consumer(None)
-        
+        else:
+            self.scheduler.set_snapshot_consumer(
+                self._handle_scheduler_snapshot,
+                interval_s=consumer_interval_s,
+            )
+
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(
@@ -226,6 +258,36 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self._last_schedule_ts: Optional[float] = None
+
+    def _resolve_snapshot_consumer_interval_s(self) -> Optional[float]:
+        intervals = [
+            interval
+            for interval in (
+                self._snapshot_simulator_update_interval_s,
+                self._snapshot_shm_publish_interval_s,
+            )
+            if interval is not None
+        ]
+        if not intervals:
+            return None
+        if any(interval <= 0.0 for interval in intervals):
+            return 0.0
+        return min(intervals)
+
+    def _handle_scheduler_snapshot(self, snapshot) -> None:
+        now = time.monotonic()
+        if self.snapshot_shm_publisher is not None:
+            interval = self._snapshot_shm_publish_interval_s or 0.0
+            if now >= self._next_snapshot_shm_publish_time:
+                payload = encode_scheduler_state_snapshot(snapshot)
+                self.snapshot_shm_publisher.publish(snapshot, payload)
+                self._next_snapshot_shm_publish_time = now + interval
+
+        if self.scheduler_simulator is not None:
+            interval = self._snapshot_simulator_update_interval_s or 0.0
+            if now >= self._next_snapshot_simulator_update_time:
+                self.scheduler_simulator.update_snapshot(snapshot)
+                self._next_snapshot_simulator_update_time = now + interval
 
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
@@ -480,6 +542,8 @@ class EngineCore:
     def shutdown(self):
         if self.scheduler_simulator is not None:
             self.scheduler_simulator.stop()
+        if self.snapshot_shm_publisher is not None:
+            self.snapshot_shm_publisher.close()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -521,6 +585,7 @@ class EngineCore:
         self,
         include_timings: bool = False,
         prompt_tokens: Optional[int] = None,
+        stop_mode: Optional[str] = None,
     ) -> dict:
         if self.scheduler_simulator is None:
             return {"enabled": False}
@@ -533,7 +598,10 @@ class EngineCore:
             )
             if callable(run_critical_path):
                 try:
-                    result = run_critical_path(int(prompt_tokens))
+                    result = run_critical_path(
+                        int(prompt_tokens),
+                        stop_mode=stop_mode,
+                    )
                 except Exception:
                     logger.exception(
                         "Prompt-aware wait-time simulation failed; falling back "
@@ -541,7 +609,11 @@ class EngineCore:
                     )
                 else:
                     if result is not None:
-                        simulation_mode = "critical_path_prompt_override"
+                        simulation_mode = (
+                            f"critical_path_{stop_mode}"
+                            if stop_mode
+                            else "critical_path_prefill_done"
+                        )
 
         if result is None:
             result = self.scheduler_simulator.latest_result()

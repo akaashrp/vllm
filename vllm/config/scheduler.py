@@ -134,6 +134,10 @@ class SchedulerConfig:
     simulation_sum_sq_coeff: float = 0
     output_length_model_path: Optional[str] = None
     output_length_tail_quantile: float = 0.9
+    enable_snapshot_shm_publishing: bool = False
+    snapshot_shm_name: Optional[str] = None
+    snapshot_shm_size_bytes: int = 8 * 1024 * 1024
+    snapshot_shm_publish_interval_ms: int = 0
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
@@ -335,6 +339,21 @@ class SchedulerConfig:
             raise ValueError(
                 "wait_time_simulation_interval_ms must be greater than 0 when "
                 "enable_wait_time_simulation is True."
+            )
+        if (
+            self.enable_snapshot_shm_publishing
+            and not self.snapshot_shm_name
+        ):
+            raise ValueError(
+                "snapshot_shm_name must be set when "
+                "enable_snapshot_shm_publishing is True."
+            )
+        if self.snapshot_shm_size_bytes <= 0:
+            raise ValueError("snapshot_shm_size_bytes must be greater than 0.")
+        if self.snapshot_shm_publish_interval_ms < 0:
+            raise ValueError(
+                "snapshot_shm_publish_interval_ms must be greater than or equal "
+                "to 0."
             )
         if not (0.0 < self.output_length_tail_quantile < 1.0):
             raise ValueError(

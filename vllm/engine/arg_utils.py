@@ -464,6 +464,14 @@ class EngineArgs:
     simulation_sum_sq_coeff: float = SchedulerConfig.simulation_sum_sq_coeff
     output_length_model_path: Optional[str] = SchedulerConfig.output_length_model_path
     output_length_tail_quantile: float = SchedulerConfig.output_length_tail_quantile
+    enable_snapshot_shm_publishing: bool = (
+        SchedulerConfig.enable_snapshot_shm_publishing
+    )
+    snapshot_shm_name: Optional[str] = SchedulerConfig.snapshot_shm_name
+    snapshot_shm_size_bytes: int = SchedulerConfig.snapshot_shm_size_bytes
+    snapshot_shm_publish_interval_ms: int = (
+        SchedulerConfig.snapshot_shm_publish_interval_ms
+    )
 
     disable_hybrid_kv_cache_manager: bool = (
         SchedulerConfig.disable_hybrid_kv_cache_manager
@@ -1071,6 +1079,22 @@ class EngineArgs:
             "--output-length-tail-quantile",
             **scheduler_kwargs["output_length_tail_quantile"],
         )
+        scheduler_group.add_argument(
+            "--enable-snapshot-shm-publishing",
+            **scheduler_kwargs["enable_snapshot_shm_publishing"],
+        )
+        scheduler_group.add_argument(
+            "--snapshot-shm-name",
+            **scheduler_kwargs["snapshot_shm_name"],
+        )
+        scheduler_group.add_argument(
+            "--snapshot-shm-size-bytes",
+            **scheduler_kwargs["snapshot_shm_size_bytes"],
+        )
+        scheduler_group.add_argument(
+            "--snapshot-shm-publish-interval-ms",
+            **scheduler_kwargs["snapshot_shm_publish_interval_ms"],
+        )
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1563,6 +1587,12 @@ class EngineArgs:
             simulation_sum_sq_coeff=self.simulation_sum_sq_coeff,
             output_length_model_path=self.output_length_model_path,
             output_length_tail_quantile=self.output_length_tail_quantile,
+            enable_snapshot_shm_publishing=self.enable_snapshot_shm_publishing,
+            snapshot_shm_name=self.snapshot_shm_name,
+            snapshot_shm_size_bytes=self.snapshot_shm_size_bytes,
+            snapshot_shm_publish_interval_ms=(
+                self.snapshot_shm_publish_interval_ms
+            ),
             is_multimodal_model=model_config.is_multimodal_model,
             is_encoder_decoder=model_config.is_encoder_decoder,
             send_delta_data=(envs.VLLM_USE_RAY_SPMD_WORKER and parallel_config.use_ray),

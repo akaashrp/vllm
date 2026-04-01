@@ -1475,7 +1475,6 @@ class Scheduler(SchedulerInterface):
         running_context_length_sum_snapshot = 0
         running_context_length_sq_sum_snapshot = 0
 
-        max_arrival_time = -1
         for request_id, request in self.requests.items():
             kv_blocks = self.kv_cache_manager.get_blocks(request_id)
             kv_block_counts = tuple(len(block_group) for block_group in kv_blocks.blocks)
@@ -1554,28 +1553,6 @@ class Scheduler(SchedulerInterface):
                 is_long_prompt=long_threshold > 0 and num_prompt_tokens >= long_threshold,
                 kv_block_counts=kv_block_counts,
             )
-            max_arrival_time = max(max_arrival_time, request.arrival_time)
-
-        num_prompt_tokens = 8192
-        dummy_request_id = "__DUMMY__"
-        requests[dummy_request_id] = RequestStateSnapshot(
-            request_id=dummy_request_id,
-            status="WAITING",
-            priority=0,
-            arrival_time=max_arrival_time + 1,
-            num_prompt_tokens=num_prompt_tokens,
-            num_computed_tokens=0,
-            num_output_target_tokens=1024,
-            num_prompt_processed_tokens=0,
-            num_output_processed_tokens=0,
-            max_tokens=2048,
-            num_preemptions=0,
-            num_cached_tokens=-1,
-            is_long_prompt=long_threshold > 0 and num_prompt_tokens >= long_threshold,
-            kv_block_counts=tuple(0 for _ in self.kv_cache_config.kv_cache_groups)
-        )
-
-        waiting_request_ids = waiting_request_ids + [dummy_request_id]
         prefill_backlog_total = prefill_backlog_running + prefill_backlog_waiting
         prefill_backlog_total_sq_sum = (
             prefill_backlog_running_sq_sum + prefill_backlog_waiting_sq_sum
@@ -1599,7 +1576,7 @@ class Scheduler(SchedulerInterface):
             version=self._snapshot_version,
             created_at=created_at,
             num_running=len(self.running),
-            num_waiting=len(self.waiting) + 1,
+            num_waiting=len(self.waiting),
             running_request_ids=running_request_ids,
             waiting_request_ids=waiting_request_ids,
             requests=requests,
