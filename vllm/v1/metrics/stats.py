@@ -57,6 +57,7 @@ class SchedulerStats:
     batch_sq_sum_context_len: int = 0
     batch_avg_context_len: float = 0.0
     batch_max_context_len: int = 0
+    batch_prefill_x_processed_ctx_sum: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0

@@ -173,6 +173,7 @@ class SchedulerOutput:
     batch_sq_sum_context_len: int = 0
     batch_avg_context_len: float = 0.0
     batch_max_context_len: int = 0
+    batch_prefill_x_processed_ctx_sum: int = 0
 
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None

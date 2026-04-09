@@ -252,6 +252,7 @@ class Scheduler(SchedulerInterface):
         batch_total_context_len = 0
         batch_sq_sum_context_len = 0
         batch_max_context_len = 0
+        batch_prefill_x_processed_ctx_sum = 0
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -374,6 +375,8 @@ class Scheduler(SchedulerInterface):
             batch_total_context_len += ctx_len
             batch_sq_sum_context_len += ctx_len * ctx_len
             batch_max_context_len = max(batch_max_context_len, ctx_len)
+            processed_ctx = min(request.num_prompt_tokens, request.num_computed_tokens)
+            batch_prefill_x_processed_ctx_sum += prefill * processed_ctx
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -641,6 +644,8 @@ class Scheduler(SchedulerInterface):
                 batch_total_context_len += ctx_len
                 batch_sq_sum_context_len += ctx_len * ctx_len
                 batch_max_context_len = max(batch_max_context_len, ctx_len)
+                processed_ctx = min(request.num_prompt_tokens, num_computed_tokens)
+                batch_prefill_x_processed_ctx_sum += prefill * processed_ctx
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -722,6 +727,7 @@ class Scheduler(SchedulerInterface):
                 else 0.0
             ),
             batch_max_context_len=batch_max_context_len,
+            batch_prefill_x_processed_ctx_sum=batch_prefill_x_processed_ctx_sum,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
@@ -1036,6 +1042,9 @@ class Scheduler(SchedulerInterface):
         batch_sq_sum_context_len = scheduler_output.batch_sq_sum_context_len
         batch_avg_context_len = scheduler_output.batch_avg_context_len
         batch_max_context_len = scheduler_output.batch_max_context_len
+        batch_prefill_x_processed_ctx_sum = (
+            scheduler_output.batch_prefill_x_processed_ctx_sum
+        )
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
@@ -1205,6 +1214,7 @@ class Scheduler(SchedulerInterface):
                 batch_sq_sum_context_len=batch_sq_sum_context_len,
                 batch_avg_context_len=batch_avg_context_len,
                 batch_max_context_len=batch_max_context_len,
+                batch_prefill_x_processed_ctx_sum=batch_prefill_x_processed_ctx_sum,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -1695,6 +1705,7 @@ class Scheduler(SchedulerInterface):
         batch_sq_sum_context_len: int = 0,
         batch_avg_context_len: float = 0.0,
         batch_max_context_len: int = 0,
+        batch_prefill_x_processed_ctx_sum: int = 0,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -1721,6 +1732,7 @@ class Scheduler(SchedulerInterface):
             batch_sq_sum_context_len=batch_sq_sum_context_len,
             batch_avg_context_len=batch_avg_context_len,
             batch_max_context_len=batch_max_context_len,
+            batch_prefill_x_processed_ctx_sum=batch_prefill_x_processed_ctx_sum,
             kv_cache_usage=self.kv_cache_manager.usage,
             kv_cache_hit_rate=hit_rate,
             kv_cache_queries=total_queries,

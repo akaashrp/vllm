@@ -27,6 +27,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine.output_length_predictor import (
     AdmissionFeatures,
     HashingSemanticProjector,
+    PromptFeatureContext,
     PromptFeatureExtractor,
 )
 
@@ -81,8 +82,16 @@ class AccuracyFeatureBuilder:
             return self._model_descriptors[model_id]
         return self._model_descriptors["__default__"]
 
-    def build_feature_row(self, admission: AdmissionFeatures) -> np.ndarray:
-        base = self._prompt_extractor.build_feature_row(admission)
+    def build_feature_row(
+        self,
+        admission: AdmissionFeatures,
+        *,
+        prompt_context: Optional[PromptFeatureContext] = None,
+    ) -> np.ndarray:
+        base = self._prompt_extractor.build_feature_row(
+            admission,
+            prompt_context=prompt_context,
+        )
         desc = self._descriptor_for(admission.model_id)
         extra = np.asarray(
             [desc.log_num_params, desc.max_context_length],
@@ -144,21 +153,38 @@ class AccuracyPredictor:
             return float(1.0 / (1.0 + np.exp(-value)))
         raise ValueError(f"Unsupported target link: {self._target_link!r}")
 
-    def predict(self, admission: AdmissionFeatures) -> float:
+    def predict(
+        self,
+        admission: AdmissionFeatures,
+        *,
+        prompt_context: Optional[PromptFeatureContext] = None,
+    ) -> float:
         """Return \\hat A(x, m) for a single request/model pair."""
         if admission.prompt_token_count <= 0:
             raise ValueError("prompt_token_count must be positive for scoring.")
-        features = self._feature_builder.build_feature_row(admission)
-        with self._lock:
-            pred = float(self._booster.predict(features.reshape(1, -1))[0])
-        return self._inverse_link(pred)
+        predictions = self.predict_batch(
+            [admission],
+            prompt_context=prompt_context,
+        )
+        return predictions[0]
 
-    def predict_batch(self, admissions: Sequence[AdmissionFeatures]) -> list[float]:
+    def predict_batch(
+        self,
+        admissions: Sequence[AdmissionFeatures],
+        *,
+        prompt_context: Optional[PromptFeatureContext] = None,
+    ) -> list[float]:
         """Predict accuracy for multiple request/model pairs in a single LightGBM call."""
         if not admissions:
             return []
         feature_matrix = np.vstack(
-            [self._feature_builder.build_feature_row(adm) for adm in admissions]
+            [
+                self._feature_builder.build_feature_row(
+                    adm,
+                    prompt_context=prompt_context,
+                )
+                for adm in admissions
+            ]
         )
         with self._lock:
             preds = self._booster.predict(feature_matrix)

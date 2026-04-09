@@ -257,7 +257,7 @@ class PerRequestWaitTimeLogger(StatLoggerBase):
                 finished_req.inference_time,
                 finished_req.e2e_latency,
             )
-            self._logger.info("%s", message)
+            # self._logger.info("%s", message)
             if self._file_writer:
                 self._file_writer.enqueue(message)
 
@@ -1044,6 +1044,7 @@ class AsyncBatchFileStatLogger(StatLoggerBase):
         "sum_sq_tokens",
         "avg_tokens",
         "max_tokens",
+        "prefill_x_processed_ctx_sum",
     )
     _HEADER_LINE = ",".join(_HEADER_COLUMNS) + "\n"
     _HEADER_LOCK = threading.Lock()
@@ -1140,7 +1141,8 @@ class AsyncBatchFileStatLogger(StatLoggerBase):
             f"{scheduler_stats.batch_total_context_len},"
             f"{scheduler_stats.batch_sq_sum_context_len},"
             f"{scheduler_stats.batch_avg_context_len:.6f},"
-            f"{scheduler_stats.batch_max_context_len}\n"
+            f"{scheduler_stats.batch_max_context_len},"
+            f"{scheduler_stats.batch_prefill_x_processed_ctx_sum}\n"
         )
         self._coalescing_put(entry)
 

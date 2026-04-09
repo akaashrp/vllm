@@ -364,9 +364,6 @@ class AsyncLLM(EngineClient):
         prediction = self.output_length_predictor.predict(admission)
         if prediction is None:
             return
-        request.predicted_output_tokens_p50 = prediction.median_tokens
-        request.predicted_output_tokens_tail = prediction.tail_tokens
-        request.predicted_output_tokens_quantile = prediction.quantile
         request.predicted_output_tokens_mean = prediction.mean_tokens
 
     async def _add_request(

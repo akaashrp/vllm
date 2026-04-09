@@ -31,9 +31,6 @@ if TYPE_CHECKING:
 @dataclass(slots=True)
 class OutputLengthPrediction:
     mean_tokens: float
-    median_tokens: float
-    tail_tokens: float
-    quantile: float
 
 
 class Request:
@@ -165,27 +162,16 @@ class Request:
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
         )
-        if request.predicted_output_tokens_tail is not None:
-            median = (
-                request.predicted_output_tokens_p50
-                if request.predicted_output_tokens_p50 is not None
-                else request.predicted_output_tokens_tail
-            )
-            mean = (
-                request.predicted_output_tokens_mean
-                if request.predicted_output_tokens_mean is not None
-                else median
-            )
-            quantile = (
-                request.predicted_output_tokens_quantile
-                if request.predicted_output_tokens_quantile is not None
-                else 0.9
-            )
+        mean = request.predicted_output_tokens_mean
+        if mean is None:
+            # Compatibility fallback for senders that still populate tail/P50 only.
+            if request.predicted_output_tokens_tail is not None:
+                mean = request.predicted_output_tokens_tail
+            elif request.predicted_output_tokens_p50 is not None:
+                mean = request.predicted_output_tokens_p50
+        if mean is not None:
             instance.output_length_prediction = OutputLengthPrediction(
                 mean_tokens=float(mean),
-                median_tokens=float(median),
-                tail_tokens=float(request.predicted_output_tokens_tail),
-                quantile=float(quantile),
             )
         return instance
 

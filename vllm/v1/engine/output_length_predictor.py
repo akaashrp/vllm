@@ -4,8 +4,8 @@ Output-length prediction utilities for wait-time simulation.
 This module provides both feature engineering and inference helpers for
 tree-based regressors trained to predict total output lengths at request
 admission time. The predictor consumes prompt-level features, including a
-hashed semantic embedding reduced with PCA, and returns mean / median /
-tail quantile estimates in token space.
+hashed semantic embedding reduced with PCA, and returns mean output-length
+estimates in token space.
 """
 
 from __future__ import annotations
@@ -32,9 +32,6 @@ class OutputLengthPrediction:
     """Container for the predicted request length statistics."""
 
     mean_tokens: float
-    median_tokens: float
-    tail_tokens: float
-    quantile: float
 
 
 @dataclass(frozen=True)
@@ -44,6 +41,15 @@ class AdmissionFeatures:
     model_id: str
     prompt_text: Optional[str]
     prompt_token_count: int
+
+
+@dataclass(frozen=True)
+class PromptFeatureContext:
+    """Prompt-only feature cache reused across models/predictors."""
+
+    prompt_values: np.ndarray
+    semantic_projection: np.ndarray
+    semantic_hash_dim: int
 
 
 class HashingSemanticProjector:
@@ -92,6 +98,14 @@ class HashingSemanticProjector:
         vec /= max(len(tokens), 1)
         return vec
 
+    def project_hashed(self, hashed: np.ndarray) -> np.ndarray:
+        if self._components is None or self._mean is None:
+            raise RuntimeError(
+                "Semantic projector has not been initialized with PCA weights."
+            )
+        centered = np.asarray(hashed, dtype=np.float32) - self._mean
+        return centered @ self._components.T
+
     def project(self, text: Optional[str]) -> np.ndarray:
         if self._components is None or self._mean is None:
             raise RuntimeError(
@@ -99,9 +113,7 @@ class HashingSemanticProjector:
             )
         if not text:
             return np.zeros(self._components.shape[0], dtype=np.float32)
-        hashed = self.hash_text(text)
-        centered = hashed - self._mean
-        return centered @ self._components.T
+        return self.project_hashed(self.hash_text(text))
 
     def metadata(self) -> dict:
         return {
@@ -278,7 +290,113 @@ class PromptFeatureExtractor:
     def _has_delimiters(self, text: str) -> bool:
         return "```" in text or bool(self._XML_RE.search(text))
 
-    def build_feature_row(self, admission: AdmissionFeatures) -> np.ndarray:
+    def build_prompt_context(
+        self,
+        *,
+        prompt_text: Optional[str],
+        prompt_token_count: int,
+    ) -> PromptFeatureContext:
+        text = prompt_text or ""
+        text_lower = text.lower()
+        prompt_chars = len(text)
+        prompt_tokens = max(prompt_token_count, 0)
+        lines = self._count_lines(text)
+        sentences = self._count_sentences(text)
+        avg_chars = (prompt_chars / prompt_tokens) if prompt_tokens > 0 else 0.0
+        has_length, requested_words, requested_bullets = self._detect_length_constraint(text)
+        list_request = (
+            requested_bullets > 0
+            or bool(self._LIST_KEYWORDS.search(text))
+            or "\n- " in text
+            or "\n* " in text
+        )
+        summary_request = bool(self._SUMMARY_KEYWORDS.search(text))
+        explanation_request = bool(self._EXPLAIN_KEYWORDS.search(text))
+        code_request = bool(self._CODE_KEYWORDS.search(text)) or "```" in text
+        translation_request = bool(self._TRANSLATE_KEYWORDS.search(text)) or bool(
+            self._LANGUAGE_RE.search(text)
+        )
+        conversation_turns = self._conversation_turns(text)
+        has_system_text = self._has_system_text(text_lower)
+        has_delimiters = self._has_delimiters(text)
+
+        if text:
+            semantic = self._semantic.project_hashed(self._semantic.hash_text(text))
+        else:
+            semantic = np.zeros(
+                len(self._feature_names) - len(self.BASE_FEATURES),
+                dtype=np.float32,
+            )
+
+        prompt_values = np.asarray(
+            [
+                float(prompt_tokens),
+                float(prompt_chars),
+                float(lines),
+                float(sentences),
+                float(avg_chars),
+                1.0 if has_length else 0.0,
+                float(requested_words),
+                float(requested_bullets),
+                1.0 if list_request else 0.0,
+                1.0 if summary_request else 0.0,
+                1.0 if explanation_request else 0.0,
+                1.0 if code_request else 0.0,
+                1.0 if translation_request else 0.0,
+                float(conversation_turns),
+                1.0 if has_system_text else 0.0,
+                1.0 if has_delimiters else 0.0,
+            ],
+            dtype=np.float32,
+        )
+        return PromptFeatureContext(
+            prompt_values=prompt_values,
+            semantic_projection=np.asarray(semantic, dtype=np.float32),
+            semantic_hash_dim=self._semantic.dimension,
+        )
+
+    def _context_compatible(self, prompt_context: PromptFeatureContext) -> bool:
+        semantic = np.asarray(prompt_context.semantic_projection, dtype=np.float32)
+        semantic_dim = len(self._feature_names) - len(self.BASE_FEATURES)
+        return (
+            int(prompt_context.semantic_hash_dim) == int(self._semantic.dimension)
+            and prompt_context.prompt_values.shape == (16,)
+            and semantic.shape == (semantic_dim,)
+        )
+
+    def build_feature_row_from_context(
+        self,
+        *,
+        model_id: str,
+        prompt_context: PromptFeatureContext,
+    ) -> np.ndarray:
+        semantic = np.asarray(prompt_context.semantic_projection, dtype=np.float32)
+        prompt_values = np.asarray(prompt_context.prompt_values, dtype=np.float32)
+        feature_vector = np.concatenate(
+            [
+                np.asarray([float(self.model_index(model_id))], dtype=np.float32),
+                prompt_values,
+            ]
+        )
+        if semantic.size:
+            feature_vector = np.concatenate([feature_vector, semantic])
+        return feature_vector.astype(np.float32)
+
+    def build_feature_row(
+        self,
+        admission: AdmissionFeatures,
+        *,
+        prompt_context: Optional[PromptFeatureContext] = None,
+    ) -> np.ndarray:
+        if (
+            prompt_context is not None
+            and self._context_compatible(prompt_context)
+        ):
+            return self.build_feature_row_from_context(
+                model_id=admission.model_id,
+                prompt_context=prompt_context,
+            )
+
         prompt_text = admission.prompt_text or ""
         prompt_lower = prompt_text.lower()
         prompt_chars = len(prompt_text)
@@ -359,12 +477,6 @@ class OutputLengthPredictor:
             feature_order=feature_order,
         )
 
-        self._quantile = (
-            preferred_quantile if preferred_quantile is not None else metadata["tail_quantile"]
-        )
-        self._median_model = self._load_booster(self._model_dir / "median_model.txt")
-        self._tail_model = self._load_booster(self._model_dir / "quantile_model.txt")
-
         mean_model_filename = metadata.get("mean_model_file", "mean_model.txt")
         mean_model_path = self._model_dir / mean_model_filename
         self._mean_model_outputs_log = False
@@ -374,10 +486,10 @@ class OutputLengthPredictor:
             self._mean_model_outputs_log = mean_model_target != "tokens"
         else:
             LOGGER.warning(
-                "Mean output-length model not found at %s; using median head fallback.",
+                "Mean output-length model not found at %s; using median head as mean fallback.",
                 mean_model_path,
             )
-            self._mean_model = self._median_model
+            self._mean_model = self._load_booster(self._model_dir / "median_model.txt")
             self._mean_model_outputs_log = True
 
         self._lock = threading.Lock()
@@ -389,27 +501,56 @@ class OutputLengthPredictor:
         booster = lgb.Booster(model_file=str(path))
         return booster
 
-    def predict(self, admission: AdmissionFeatures) -> Optional[OutputLengthPrediction]:
-        """Return mean/P50/PQ estimates (tokens) for the provided request."""
-        if admission.prompt_token_count <= 0:
-            return None
-        features = self._feature_extractor.build_feature_row(admission)
-        with self._lock:
-            mean_pred = float(self._mean_model.predict(features.reshape(1, -1))[0])
-            median_log = float(self._median_model.predict(features.reshape(1, -1))[0])
-            tail_log = float(self._tail_model.predict(features.reshape(1, -1))[0])
-        if self._mean_model_outputs_log:
-            mean_tokens = max(math.expm1(mean_pred), 1.0)
-        else:
-            mean_tokens = max(mean_pred, 1.0)
-        median_tokens = max(math.expm1(median_log), 1.0)
-        tail_tokens = max(math.expm1(tail_log), mean_tokens, median_tokens, 1.0)
-        return OutputLengthPrediction(
-            mean_tokens=mean_tokens,
-            median_tokens=median_tokens,
-            tail_tokens=tail_tokens,
-            quantile=self._quantile,
+    def predict(
+        self,
+        admission: AdmissionFeatures,
+        *,
+        prompt_context: Optional[PromptFeatureContext] = None,
+    ) -> Optional[OutputLengthPrediction]:
+        """Return mean output-length estimate (tokens) for the provided request."""
+        predictions = self.predict_batch(
+            [admission],
+            prompt_context=prompt_context,
         )
+        return predictions[0] if predictions else None
+
+    def predict_batch(
+        self,
+        admissions: Sequence[AdmissionFeatures],
+        *,
+        prompt_context: Optional[PromptFeatureContext] = None,
+    ) -> list[Optional[OutputLengthPrediction]]:
+        """Predict mean output lengths for many request/model pairs in one pass."""
+        if not admissions:
+            return []
+        feature_rows: list[np.ndarray] = []
+        valid_indices: list[int] = []
+        results: list[Optional[OutputLengthPrediction]] = [None] * len(admissions)
+        for idx, admission in enumerate(admissions):
+            if admission.prompt_token_count <= 0:
+                continue
+            features = self._feature_extractor.build_feature_row(
+                admission,
+                prompt_context=prompt_context,
+            )
+            feature_rows.append(features)
+            valid_indices.append(idx)
+        if not feature_rows:
+            return results
+        feature_matrix = np.vstack(feature_rows)
+        with self._lock:
+            mean_preds = self._mean_model.predict(feature_matrix)
+
+        for offset, admission_idx in enumerate(valid_indices):
+            mean_pred = float(mean_preds[offset])
+            if self._mean_model_outputs_log:
+                mean_tokens = max(math.expm1(mean_pred), 1.0)
+            else:
+                mean_tokens = max(mean_pred, 1.0)
+            results[admission_idx] = OutputLengthPrediction(
+                mean_tokens=mean_tokens,
+            )
+        return results
 
 
 def load_predictor_if_available(
