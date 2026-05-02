@@ -112,10 +112,7 @@ class AsyncLLM(EngineClient):
         self.processor = Processor(vllm_config, mm_registry=mm_registry)
         self.output_length_predictor: Optional[OutputLengthPredictor] = None
         sched_cfg = vllm_config.scheduler_config
-        if (
-            sched_cfg.enable_wait_time_simulation
-            and sched_cfg.output_length_model_path
-        ):
+        if sched_cfg.output_length_model_path:
             try:
                 self.output_length_predictor = OutputLengthPredictor(
                     sched_cfg.output_length_model_path,
@@ -362,8 +359,7 @@ class AsyncLLM(EngineClient):
             prompt_token_count=prompt_tokens,
         )
         prediction = self.output_length_predictor.predict(admission)
-        if prediction is None:
-            return
+        assert prediction is not None, "OutputLengthPredictor failed to return a prediction"
         request.predicted_output_tokens_mean = prediction.mean_tokens
 
     async def _add_request(

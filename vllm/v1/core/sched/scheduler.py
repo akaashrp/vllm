@@ -1387,13 +1387,11 @@ class Scheduler(SchedulerInterface):
     ) -> int:
         warm = num_residuals >= min_samples
 
-        if kv_usage > 0.95 and num_waiting > 0:
-            return 256 if warm else 512
-        if kv_usage > 0.85:
-            return 128 if warm else 256
-        if kv_usage > 0.70:
-            return 64 if warm else 128
-        return 16 if warm else 32
+        if kv_usage > 0.90:
+            return 128
+        if kv_usage > 0.80:
+            return 64
+        return 32
 
     @staticmethod
     def _decode_tail_quantile_for_congestion(
@@ -1403,13 +1401,18 @@ class Scheduler(SchedulerInterface):
         min_samples: int,
     ) -> float:
         warm = num_residuals >= min_samples
+        high_congestion = kv_usage > 0.90
+        medium_congestion = kv_usage > 0.80
 
-        if kv_usage > 0.95 and num_waiting > 0:
-            return 0.97 if warm else 0.95
-        if kv_usage > 0.85:
-            return 0.94 if warm else 0.92
-        return 0.90 if warm else 0.88
+        if not warm:
+            return 0.50
 
+        if high_congestion:
+            return 0.85
+        if medium_congestion:
+            return 0.75
+        return 0.65
+    
     def _compute_adaptive_decode_reserve(
         self,
         *,
@@ -1418,14 +1421,7 @@ class Scheduler(SchedulerInterface):
         snapshot_base_reserve_tokens: float,
     ) -> int:
         base_reserve = max(0.0, float(snapshot_base_reserve_tokens))
-        overshoot = max(
-            0.0, float(num_output_processed_tokens) - float(predicted_target)
-        )
-        reserve = max(
-            base_reserve,
-            float(self._decode_tail_alpha) * overshoot,
-        )
-        return max(1, int(math.ceil(reserve)))
+        return max(1, int(math.ceil(base_reserve)))
 
     def _snapshot_decode_reserve_base_tokens(
         self,
@@ -1512,15 +1508,16 @@ class Scheduler(SchedulerInterface):
                 num_output_processed_tokens=int(num_output_processed_tokens),
                 snapshot_base_reserve_tokens=float(snapshot_base_reserve_tokens),
             )
+            assert predicted_target is not None, "No output length prediction available for request"
             if predicted_target is not None and predicted_target > 0:
-                num_output_target_tokens = predicted_target
+                num_output_target_tokens = predicted_target + adaptive_reserve
             else:
                 num_output_target_tokens = (
                     max(num_output_processed_tokens, request.max_tokens // 2) + 1
                 )
             num_output_target_tokens = max(
                 num_output_target_tokens,
-                num_output_processed_tokens + adaptive_reserve,
+                num_output_processed_tokens + 1,
             )
             decode_budget = max(self.max_model_len - num_prompt_tokens, 1)
             num_output_target_tokens = min(
